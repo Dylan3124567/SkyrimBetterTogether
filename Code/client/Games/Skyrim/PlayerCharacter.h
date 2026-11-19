@@ -124,7 +124,7 @@ struct PlayerCharacter : Actor
     float GetSkillExperience(Skills::Skill aSkill) const noexcept { return (*pSkills)->skills[aSkill].xp; }
 
     NiPoint3 RespawnPlayer() noexcept;
-    // Clears Survival Mode's cold, and the health it takes away
+    // Takes Survival Mode's cold down to Very Cold, below what kills the player
     void WarmUp() noexcept;
 
     void PayCrimeGoldToAllFactions() noexcept;

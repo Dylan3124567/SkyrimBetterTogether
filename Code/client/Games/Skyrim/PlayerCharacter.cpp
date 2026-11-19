@@ -130,13 +130,17 @@ void PlayerCharacter::WarmUp() noexcept
 
     // Survival_ColdNeedValue, the NeedValue of Survival_NeedColdQuest. The quest reads it back on its next tick.
     auto* pCold = Cast<TESGlobal>(TESForm::GetById(pSurvival->GetFormId(0x81B)));
-    if (!pCold || pCold->f <= 0.f)
+    // Survival_NeedCold's stage 3 value: the start of Very Cold, about a fifth of the health gone. Death mustn't be a way
+    // to get warm, the player still has a few minutes to reach a fire before it gets dangerous again.
+    constexpr float cRespawnCold = 300.f;
+    if (!pCold || pCold->f <= cRespawnCold)
         return;
 
-    spdlog::info("Respawning at cold {}, warming the player up", pCold->f);
-    pCold->f = 0.f;
+    spdlog::info("Respawning at cold {}, down to very cold ({})", pCold->f, cRespawnCold);
+    pCold->f = cRespawnCold;
 
-    // Survival_GlobalFunctions.ColdHealthPenaltyAV(), the health the cold takes away
+    // Survival_GlobalFunctions.ColdHealthPenaltyAV(), the health the cold takes away. The quest's next tick sets the
+    // penalty for the new cold, until then none, so the player gets up healed.
     SetActorValue(ActorValueInfo::kVariable04, 0.f);
 
     // needSpells of Survival_NeedColdQuest, cold stages 0 to 5. The quest adds the right one back on its next tick.
@@ -153,7 +157,7 @@ NiPoint3 PlayerCharacter::RespawnPlayer() noexcept
     SetNoBleedoutRecovery(false);
 
     // Survival Mode kills the player at maximum cold, and that same cold takes away all of their health. Respawning still
-    // that cold kills them again within seconds, over and over. Death restores warmth the way a fire does.
+    // that cold kills them again within seconds, over and over, so death takes the cold down to Very Cold.
     WarmUp();
 
     DispelAllSpells();
