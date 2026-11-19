@@ -119,6 +119,10 @@ void ObjectService::OnAssignObjectsRequest(const PacketEvent<AssignObjectsReques
 
 void ObjectService::OnActivate(const PacketEvent<ActivateRequest>& acMessage) const noexcept
 {
+    const auto* pOwner = m_world.try_get<OwnerComponent>(static_cast<entt::entity>(acMessage.Packet.ActivatorId));
+    if (!pOwner || pOwner->GetOwner() != acMessage.pPlayer)
+        return;
+
     NotifyActivate notifyActivate;
     notifyActivate.Id = acMessage.Packet.Id;
     notifyActivate.ActivatorId = acMessage.Packet.ActivatorId;

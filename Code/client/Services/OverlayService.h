@@ -1,6 +1,7 @@
 #pragma once
 
 #include <include/internal/cef_ptr.h>
+#include <Services/HostSession.h>
 
 namespace TiltedPhoques
 {
@@ -29,6 +30,7 @@ struct NotifyPlayerHealthUpdate;
 enum ChatMessageTypes;
 struct PartyJoinedEvent;
 struct PartyLeftEvent;
+struct BSFixedString;
 
 using TiltedPhoques::OverlayApp;
 
@@ -52,6 +54,9 @@ struct OverlayService
 
     void SetActive(bool aActive) noexcept;
     [[nodiscard]] bool GetActive() const noexcept;
+    bool IsMenuShortcut(uint16_t aX, uint16_t aY) const noexcept;
+    // The game was asked to open a menu, called before the menu exists. Gives the page a head start on the strip.
+    void PrepareMenuShortcut(const BSFixedString& acMenu) noexcept;
 
     void SetInGame(bool aInGame) noexcept;
     [[nodiscard]] bool GetInGame() const noexcept;
@@ -63,6 +68,7 @@ struct OverlayService
     void SendSystemMessage(const std::string& acMessage);
 
     void SetPlayerHealthPercentage(uint32_t aFormId) const noexcept;
+    HostSession& GetHostSession() noexcept { return m_hostSession; }
 
 protected:
     void OnUpdate(const UpdateEvent&) noexcept;
@@ -83,8 +89,12 @@ protected:
     void OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept;
 
 private:
+    HostSession m_hostSession;
+    uint64_t m_hostRevision = 0;
+    std::chrono::steady_clock::time_point m_nextHostUpdate{};
     void RunDebugDataUpdates() noexcept;
     void RunPlayerHealthUpdates() noexcept;
+    void ShowMenuShortcut(bool aShow) noexcept;
 
     CefRefPtr<OverlayApp> m_pOverlay{nullptr};
     TiltedPhoques::UniquePtr<D3D11RenderProvider> m_pProvider;
@@ -94,6 +104,15 @@ private:
 
     bool m_active = false;
     bool m_inGame = false;
+    // The strip is on screen, so clicks on it go to the page
+    std::atomic_bool m_menuShortcut{false};
+    // The page draws the strip, which may still be kept out of the picture
+    std::atomic_bool m_stripPainted{false};
+    // Set from the game's menu message queue, read while rendering
+    std::atomic<std::chrono::steady_clock::time_point> m_stripPreparedAt{};
+    std::chrono::steady_clock::time_point m_stripHiddenUntil{};
+    std::atomic_int m_viewHeight{1080};
+    bool m_fullscreenMenu = false;
 
     entt::scoped_connection m_updateConnection;
     entt::scoped_connection m_connectedConnection;

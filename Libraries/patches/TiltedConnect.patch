@@ -1,0 +1,97 @@
+diff --git a/Code/connect/include/SynchronizedClock.hpp b/Code/connect/include/SynchronizedClock.hpp
+index a5d9e76..0a7d068 100644
+--- a/Code/connect/include/SynchronizedClock.hpp
++++ b/Code/connect/include/SynchronizedClock.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <chrono>
++
+ #include <cstdint>
+ 
+ namespace TiltedPhoques
+diff --git a/Code/connect/src/Client.cpp b/Code/connect/src/Client.cpp
+index b7ded81..74de0d3 100644
+--- a/Code/connect/src/Client.cpp
++++ b/Code/connect/src/Client.cpp
+@@ -29,6 +29,14 @@ namespace TiltedPhoques
+ 
+     Client::~Client()
+     {
++        if (m_pHandle)
++        {
++            static_cast<uv_getaddrinfo_t*>(m_pHandle)->data = nullptr;
++            uv_cancel(static_cast<uv_req_t*>(m_pHandle));
++            uv_run(static_cast<uv_loop_t*>(m_pLoop), UV_RUN_DEFAULT);
++        }
++        if (m_connection != k_HSteamNetConnection_Invalid)
++            m_pInterface->CloseConnection(m_connection, 0, nullptr, false);
+         uv_loop_close(static_cast<uv_loop_t*>(m_pLoop));
+         Allocator::Get()->Free(m_pLoop);
+         SteamInterface::Release();
+@@ -64,14 +72,17 @@ namespace TiltedPhoques
+ 
+     bool Client::Connect(const std::string& acEndpoint) noexcept
+     {
++        if (m_pHandle || m_connection != k_HSteamNetConnection_Invalid)
++            return false;
+         static auto GetAddrInfoCallback = [](uv_getaddrinfo_t* apHandle, int aStatus, struct addrinfo* apResult)
+         {
+             SteamNetworkingIPAddr remoteAddress{};
+             bool valid = false;
+ 
+             auto* pClient = static_cast<Client*>(apHandle->loop->data);
++            const bool cancelled = apHandle->data == nullptr;
+             pClient->m_pHandle = nullptr;
+-            
++
+             if (aStatus == 0)
+             {
+                 switch (apResult->ai_family)
+@@ -94,11 +105,8 @@ namespace TiltedPhoques
+             uv_freeaddrinfo(apResult);
+             Allocator::GetDefault()->Free(apHandle);
+ 
+-            if(aStatus == UV_ECANCELED)
+-            {
+-                pClient->OnDisconnected(kAborted);
++            if (cancelled)
+                 return;
+-            }
+ 
+             if (!valid)
+             {
+@@ -124,9 +132,17 @@ namespace TiltedPhoques
+             endpoint = endpoint.substr(0, pos);
+         }
+ 
++        if (endpoint.size() >= 2 && endpoint.front() == '[' && endpoint.back() == ']')
++            endpoint = endpoint.substr(1, endpoint.size() - 2);
+         m_pHandle = pHandle;
+-        uv_getaddrinfo(static_cast<uv_loop_t*>(m_pLoop), pHandle, GetAddrInfoCallback, endpoint.c_str(), serviceName.c_str(), nullptr);
+-
++        pHandle->data = this;
++        if (uv_getaddrinfo(static_cast<uv_loop_t*>(m_pLoop), pHandle, GetAddrInfoCallback, endpoint.c_str(), serviceName.c_str(), nullptr) != 0)
++        {
++            m_pHandle = nullptr;
++            Allocator::GetDefault()->Free(pHandle);
++            OnDisconnected(kCannotResolve);
++            return false;
++        }
+         return true;
+     }
+ 
+@@ -159,9 +175,12 @@ namespace TiltedPhoques
+             OnDisconnected(kAborted);
+         }
+ 
+-        if(m_pHandle != nullptr)
++        if (m_pHandle != nullptr && static_cast<uv_getaddrinfo_t*>(m_pHandle)->data != nullptr)
+         {
++            // uv_cancel can lose the race to DNS completion; suppress that callback explicitly.
++            static_cast<uv_getaddrinfo_t*>(m_pHandle)->data = nullptr;
+             uv_cancel(static_cast<uv_req_t*>(m_pHandle));
++            OnDisconnected(kAborted);
+         }
+     }
+ 

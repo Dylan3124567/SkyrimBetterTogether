@@ -1,3 +1,4 @@
+#include <Services/HelgenService.h>
 #include <Misc/BSScript.h>
 #include <Misc/GameVM.h>
 
@@ -300,5 +301,19 @@ BSScript::DidLaunchSkyrimTogetherFunc::DidLaunchSkyrimTogetherFunc(const char* a
 bool BSScript::DidLaunchSkyrimTogetherFunc::MarshallAndDispatch(Variable* apBaseVar, IVirtualMachine* apVm, uint32_t aStackID, Variable* apResult, StackFrame* apStackFrame)
 {
     apResult->Set<bool>(true);
+    return true;
+}
+
+BSScript::GetHelgenHostIdFunc::GetHelgenHostIdFunc() : NativeFunction("GetHelgenHostId", "SkyrimTogetherUtils", true, 0)
+{
+    pFunction = nullptr;
+    returnType = Variable::kInteger;
+}
+
+bool BSScript::GetHelgenHostIdFunc::MarshallAndDispatch(Variable*, IVirtualMachine*, uint32_t, Variable* apResult, StackFrame*)
+{
+    const auto hostId = World::Get().ctx().at<HelgenService>().GetSceneHostId();
+    spdlog::info("Helgen script host: {:X}", hostId);
+    apResult->Set<int32_t>(static_cast<int32_t>(hostId));
     return true;
 }

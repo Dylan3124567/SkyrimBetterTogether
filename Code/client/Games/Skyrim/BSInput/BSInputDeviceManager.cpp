@@ -1,5 +1,6 @@
 
 #include <BSGraphics/BSGraphicsRenderer.h>
+#include <Playtest.h>
 
 struct BSInputDeviceManager;
 
@@ -7,18 +8,26 @@ void (*BSInputDeviceManager_PollInputDevices)(BSInputDeviceManager*, float) = nu
 
 void Hook_BSInputDeviceManager_PollInputDevices(BSInputDeviceManager* inputDeviceMgr, float afDelta)
 {
-    if (!BSGraphics::GetMainWindow()->IsForeground())
+    Playtest::Tick();
+    if (Playtest::Baseline())
+    {
+        POINTER_SKYRIMSE(uint32_t, alwaysActive, 380768);
+        *alwaysActive = 1;
+    }
+    if (!Playtest::Active() && (!BSGraphics::GetMainWindow() || !BSGraphics::GetMainWindow()->IsForeground()))
         return;
 
+    Playtest::BeginInput(afDelta);
     BSInputDeviceManager_PollInputDevices(inputDeviceMgr, afDelta);
 }
 
-static TiltedPhoques::Initializer s_initInputDeviceManager(
-    []()
-    {
-        const VersionDbPtr<void> pollInputDevices(68617);
+void Playtest::InstallInputHooks()
+{
+    const VersionDbPtr<void> pollInputDevices(68617);
 
-        BSInputDeviceManager_PollInputDevices = static_cast<decltype(BSInputDeviceManager_PollInputDevices)>(pollInputDevices.GetPtr());
+    BSInputDeviceManager_PollInputDevices = static_cast<decltype(BSInputDeviceManager_PollInputDevices)>(pollInputDevices.GetPtr());
 
-        TP_HOOK_IMMEDIATE(&BSInputDeviceManager_PollInputDevices, &Hook_BSInputDeviceManager_PollInputDevices);
-    });
+    TP_HOOK_IMMEDIATE(&BSInputDeviceManager_PollInputDevices, &Hook_BSInputDeviceManager_PollInputDevices);
+}
+
+static TiltedPhoques::Initializer s_initInputDeviceManager(Playtest::InstallInputHooks);

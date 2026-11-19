@@ -32,9 +32,12 @@
 #include <Forms/TESObjectCELL.h>
 #include <Forms/TESWorldSpace.h>
 #include <Forms/TESActorBase.h>
+#include <Games/TES.h>
 
 #include <Structs/AnimationGraphDescriptorManager.h>
 #include <Structs/AnimationVariables.h>
+
+#include <Systems/RespawnFlow.h>
 
 extern const AnimationGraphDescriptor* BehaviorVarPatch(BSAnimationGraphManager* pManager, Actor* pActor);
 
@@ -405,6 +408,40 @@ void TESObjectREFR::MoveTo(TESObjectCELL* apCell, const NiPoint3& acPosition) co
     POINTER_SKYRIMSE(TInternalMoveTo, s_internalMoveTo, 56626);
 
     TiltedPhoques::ThisCall(s_internalMoveTo, this, GetNullHandle(), apCell, apCell->worldspace, acPosition, rotation);
+}
+
+void TESObjectREFR::WarpTo(const NiPoint3& acPosition) noexcept
+{
+    TP_THIS_FUNCTION(TSetPosition, char, TESObjectREFR, const NiPoint3&);
+
+    POINTER_SKYRIMSE(TSetPosition, s_setPosition, 19790);
+
+    TiltedPhoques::ThisCall(s_setPosition, this, acPosition);
+    Update3DPosition(true);
+}
+
+TESObjectREFR* TESObjectREFR::PlaceItem(TESBoundObject* apItem, int32_t aCount, TESObjectCELL* apCell, TESWorldSpace* apWorldSpace, const NiPoint3& acPosition) noexcept
+{
+    TP_THIS_FUNCTION(
+        TCreateReference, BSPointerHandle<TESObjectREFR>*, ModManager, BSPointerHandle<TESObjectREFR>* apResult, TESBoundObject* apObject, const NiPoint3* apPosition, const NiPoint3* apRotation, TESObjectCELL* apCell, TESWorldSpace* apWorldSpace,
+        TESObjectREFR* apExisting, void* apPrimitive, void* apLinkedRoom, bool aForcePersist, bool aUnk);
+    TP_THIS_FUNCTION(TSetCount, void, ExtraDataList, uint16_t);
+
+    POINTER_SKYRIMSE(TCreateReference, s_createReference, 13723);
+    POINTER_SKYRIMSE(TSetCount, s_setCount, 11617);
+
+    const NiPoint3 cRotation{};
+    BSPointerHandle<TESObjectREFR> result{};
+    TiltedPhoques::ThisCall(s_createReference, ModManager::Get(), &result, apItem, &acPosition, &cRotation, apCell, apWorldSpace, nullptr, nullptr, nullptr, false, true);
+
+    TESObjectREFR* pReference = GetByHandle(result.handle.iBits);
+    if (pReference && aCount > 1)
+    {
+        TiltedPhoques::ThisCall(s_setCount, &pReference->extraData, static_cast<uint16_t>(aCount));
+        pReference->MarkChanged(0x400);
+    }
+
+    return pReference;
 }
 
 void TESObjectREFR::PayGold(int32_t aAmount) noexcept
@@ -1032,16 +1069,19 @@ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, u
 {
     Actor* pActivator = Cast<Actor>(apActivator);
 
+    if (apActivator == PlayerCharacter::Get())
+        RespawnProtection::Break();
+
     // Exclude books from activation since only reading them removes them from the cell
     // Note: Books are now unsynced 
-    if (pActivator && apThis->baseForm->formType != FormType::Book)
+    if (!ScopedActivateOverride::IsOverriden() && pActivator && apThis->baseForm && apThis->baseForm->formType != FormType::Book)
     {
         auto openState = TESObjectREFR::kNone;
         if (apThis->baseForm->formType == FormType::Door)
             openState = apThis->GetOpenState();
 
         World::Get().GetRunner().Trigger(
-            ActivateEvent(apThis, pActivator, apObjectToGet, aCount, aDefaultProcessing, aUnk1, openState)
+            ActivateEvent(apThis->formID, pActivator->formID, openState)
         );
     }
 

@@ -12,6 +12,7 @@
 #include <Events/PartyJoinedEvent.h>
 #include <Events/PartyLeftEvent.h>
 #include <Events/BeastFormChangeEvent.h>
+#include <Events/AddExperienceEvent.h>
 
 #include <Messages/PlayerRespawnRequest.h>
 #include <Messages/NotifyPlayerRespawn.h>
@@ -29,8 +30,12 @@
 #include <Games/Overrides.h>
 #include <Games/References.h>
 #include <AI/AIProcess.h>
+#include <AI/Movement/PlayerControls.h>
 #include <EquipManager.h>
 #include <Forms/TESRace.h>
+#include <Forms/TESQuest.h>
+#include <Games/Skyrim/Interface/UI.h>
+#include <Services/PapyrusService.h>
 
 PlayerService::PlayerService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
     : m_world(aWorld)
@@ -48,12 +53,26 @@ PlayerService::PlayerService(World& aWorld, entt::dispatcher& aDispatcher, Trans
     m_playerLevelConnection = m_dispatcher.sink<PlayerLevelEvent>().connect<&PlayerService::OnPlayerLevelEvent>(this);
     m_partyJoinedConnection = aDispatcher.sink<PartyJoinedEvent>().connect<&PlayerService::OnPartyJoinedEvent>(this);
     m_partyLeftConnection = aDispatcher.sink<PartyLeftEvent>().connect<&PlayerService::OnPartyLeftEvent>(this);
+
+    EventDispatcherManager::Get()->deathEvent.RegisterSink(this);
+}
+
+BSTEventResult PlayerService::OnEvent(const TESDeathEvent* apEvent, const EventDispatcher<TESDeathEvent>*)
+{
+    // The killer is only the player for the player's own killing blow, not for a companion's or a party member's.
+    if (!apEvent || !apEvent->pActorKiller || apEvent->pActorKiller != PlayerCharacter::Get())
+        return BSTEventResult::kOk;
+
+    const float cExperience = PlayerCharacter::TakeKillExperience();
+    if (cExperience > 0.f && m_world.GetPartyService().IsInParty())
+        m_world.GetRunner().Trigger(AddExperienceEvent(cExperience));
+
+    return BSTEventResult::kOk;
 }
 
 void PlayerService::OnUpdate(const UpdateEvent&) noexcept
 {
     RunRespawnUpdates();
-    RunPostDeathUpdates();
     RunDifficultyUpdates();
     RunLevelUpdates();
     RunBeastFormDetection();
@@ -198,23 +217,69 @@ void PlayerService::RunRespawnUpdates() noexcept
     if (!m_isDeathSystemEnabled)
         return;
 
-    static bool s_startTimer = false;
-
     PlayerCharacter* pPlayer = PlayerCharacter::Get();
-    if (!pPlayer->actorState.IsBleedingOut())
+    const bool cIsDown = pPlayer->actorState.IsBleedingOut();
+
+    if (!cIsDown && m_respawnFlow.IsUp())
     {
         m_cachedMainSpellId = pPlayer->magicItems[0] ? pPlayer->magicItems[0]->formID : 0;
         m_cachedSecondarySpellId = pPlayer->magicItems[1] ? pPlayer->magicItems[1]->formID : 0;
         m_cachedPowerId = pPlayer->equippedShout ? pPlayer->equippedShout->formID : 0;
 
-        s_startTimer = false;
-        return;
+        if (pPlayer->GetActorValue(ActorValueInfo::kHealth) > 0.f)
+            m_aliveControls = BSInputEnableManager::Get()->GetEnabledControls();
     }
 
-    if (!s_startTimer)
+    RespawnFlow::Frame frame{};
+    frame.Now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    frame.IsDown = cIsDown;
+    frame.IsStuck = cIsDown || pPlayer->actorState.IsKnockedDown();
+    frame.HasBroken = RespawnProtection::ConsumeBreak();
+
+    if (m_respawnFlow.GetPhase() != RespawnFlow::Phase::Alive)
     {
-        s_startTimer = true;
-        m_respawnDeadline = std::chrono::steady_clock::now() + 5s;
+        const auto* pUI = UI::Get();
+        frame.IsLoading = !pUI || pUI->GetMenuOpen(BSFixedString("Loading Menu")) || !pPlayer->parentCell || !pPlayer->GetNiNode();
+
+        // Looking around doesn't count, it can't hurt anyone and a nudged mouse shouldn't cost the player their protection
+        if (const auto* pControls = PlayerControls::GetInstance())
+        {
+            const auto& cMove = pControls->Data.MoveInputVec;
+            frame.HasMovementInput = pControls->Data.bAutoMove || cMove.x * cMove.x + cMove.y * cMove.y > 0.01f;
+        }
+    }
+
+    ApplyRespawnCommands(m_respawnFlow.Update(frame));
+
+    // The respawn let the player recover from bleedout so they stand up, the next time they go down must be for good again
+    if (m_canLeaveBleedout && !cIsDown && m_respawnFlow.IsUp())
+    {
+        pPlayer->SetNoBleedoutRecovery(true);
+        m_canLeaveBleedout = false;
+    }
+
+    RespawnProtection::SetActive(m_respawnFlow.IsInvulnerable());
+}
+
+void PlayerService::ApplyRespawnCommands(uint32_t aCommands) noexcept
+{
+    if (aCommands == RespawnFlow::kNone)
+        return;
+
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+
+    if (aCommands & RespawnFlow::kEndProtection)
+    {
+        PlayerCharacter::SetGodMode(false);
+
+        if (!(aCommands & RespawnFlow::kBeginDeath))
+            Utils::ShowHudMessage("Spawn protection ended.");
+    }
+
+    if (aCommands & RespawnFlow::kBeginDeath)
+    {
+        // Death disables controls in several steps. Keep the last living state until recovery.
+        m_respawnControls = m_aliveControls;
         FadeOutGame(true, true, 3.0f, true, 2.0f);
 
         // If a player dies not by its health reaching 0, getting it up from its bleedout state isn't possible
@@ -225,14 +290,15 @@ void PlayerService::RunRespawnUpdates() noexcept
         pPlayer->PayCrimeGoldToAllFactions();
     }
 
-    const auto cNow = std::chrono::steady_clock::now();
-    if (cNow >= m_respawnDeadline)
+    if (aCommands & RespawnFlow::kRespawn)
     {
+        // Before anything else, whatever killed the player may still be there and the next hit must not land
+        PlayerCharacter::SetGodMode(true);
+
         pPlayer->RespawnPlayer();
+        m_canLeaveBleedout = true;
 
         m_transport.Send(PlayerRespawnRequest());
-
-        s_startTimer = false;
 
         auto* pEquipManager = EquipManager::Get();
         TESForm* pSpell = TESForm::GetById(m_cachedMainSpellId);
@@ -244,43 +310,60 @@ void PlayerService::RunRespawnUpdates() noexcept
         pSpell = TESForm::GetById(m_cachedPowerId);
         if (pSpell)
             pEquipManager->EquipShout(pPlayer, pSpell);
-
-        m_knockdownDeadline = std::chrono::steady_clock::now() + 1500ms;
-        m_knockdownStart = true;
     }
-}
 
-// Doesn't seem to respawn quite yet
-void PlayerService::RunPostDeathUpdates() noexcept
-{
-    if (!m_isDeathSystemEnabled)
-        return;
-
-    // If a player dies in ragdoll, it gets stuck.
-    // This code ragdolls the player again upon respawning.
-    // It also makes the player invincible for 10 seconds.
-    const auto cNow = std::chrono::steady_clock::now();
-    if (m_knockdownStart && cNow >= m_knockdownDeadline)
+    if (aCommands & RespawnFlow::kForceState)
     {
-        PlayerCharacter* pPlayer = PlayerCharacter::Get();
+        spdlog::warn("Player is still down after respawning, clearing actor state: {:X}", pPlayer->actorState.flags1);
+        pPlayer->actorState.ClearDownedState();
+    }
 
-        PlayerCharacter::SetGodMode(true);
-        m_godmodeStart = true;
+    if (aCommands & RespawnFlow::kForceGraph)
+    {
+        spdlog::warn("Player is still down after respawning, resetting behavior graph");
+        BSFixedString defaultState("IdleForceDefaultState");
+        pPlayer->SendAnimationEvent(&defaultState);
+    }
 
-        pPlayer->currentProcess->KnockExplosion(pPlayer, &pPlayer->position, 0.f);
+    if (aCommands & RespawnFlow::kGetUp)
+    {
+        auto* pInput = BSInputEnableManager::Get();
+        pInput->EnableOtherEvent(m_respawnControls & ~pInput->GetEnabledControls(), true, true);
+    }
 
+    // Only when getting up from bleedout and both resets above failed, the get up from a ragdoll always ends standing
+    if (aCommands & RespawnFlow::kKnock)
+    {
+        spdlog::warn("Player is still down after respawning, ragdolling them so they get up");
+        if (pPlayer->currentProcess)
+            pPlayer->currentProcess->KnockExplosion(pPlayer, &pPlayer->position, 0.f);
+    }
+
+    if (aCommands & RespawnFlow::kFadeIn)
         FadeOutGame(false, true, 0.5f, true, 2.f);
 
-        m_godmodeDeadline = std::chrono::steady_clock::now() + 10s;
-        m_knockdownStart = false;
-    }
-
-    if (m_godmodeStart && cNow >= m_godmodeDeadline)
+    if (aCommands & RespawnFlow::kStartProtection)
     {
-        PlayerCharacter::SetGodMode(false);
+        // Controls that went missing before the last death aren't in m_respawnControls, and without these the player can
+        // only look around. The respawn already pulled the player out of whatever quest scene disabled them, except during
+        // the intro, which respawns in place.
+        auto* pIntro = Cast<TESQuest>(TESForm::GetById(0x3372B));
+        if (!pIntro || pIntro->IsStopped() || pIntro->IsStageReached(1000))
+        {
+            PAPYRUS_FUNCTION(void, Actor, SetDontMove, bool);
+            s_pSetDontMove(pPlayer, false);
 
-        m_godmodeStart = false;
+            auto* pInput = BSInputEnableManager::Get();
+            pInput->EnableOtherEvent(BSInputEnableManager::kPlayerControls & ~pInput->GetEnabledControls(), true, true);
+        }
+
+        m_respawnControls = 0;
+
+        Utils::ShowHudMessage("Spawn protection active until you move or act.");
     }
+
+    if (aCommands & RespawnFlow::kFadeInNow)
+        FadeOutGame(false, true, 0.5f, true, 0.f);
 }
 
 void PlayerService::RunDifficultyUpdates() const noexcept
@@ -345,6 +428,18 @@ void PlayerService::RunBeastFormDetection() const noexcept
 
 void PlayerService::ToggleDeathSystem(bool aSet) noexcept
 {
+    if (!aSet)
+    {
+        if (m_respawnFlow.IsInvulnerable())
+            PlayerCharacter::SetGodMode(false);
+        if (m_respawnFlow.IsScreenFaded())
+            FadeOutGame(false, true, 0.5f, true, 0.f);
+
+        m_respawnFlow.Reset();
+        RespawnProtection::SetActive(false);
+        m_respawnControls = 0;
+        m_canLeaveBleedout = false;
+    }
     m_isDeathSystemEnabled = aSet;
 
     PlayerCharacter::Get()->SetPlayerRespawnMode(aSet);

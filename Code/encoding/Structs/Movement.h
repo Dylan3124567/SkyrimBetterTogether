@@ -20,9 +20,12 @@ struct Movement
     void Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept;
 
     GameId CellId{};
+    uint32_t OwnershipEpoch{};
     GameId WorldSpaceId{};
     Vector3_NetQuantize Position{};
     Rotator2_NetQuantize Rotation{};
     AnimationVariables Variables{};
     float Direction{};
+    // The owner has the actor in furniture or restrained, remote copies can't work this out from the animations alone
+    bool IsHeldInPlace{};
 };

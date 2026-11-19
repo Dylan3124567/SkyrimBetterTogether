@@ -5,14 +5,18 @@
 #include <OverlayApp.hpp>
 
 #include <D3D11Hook.hpp>
+#include <DInputHook.hpp>
+#include <Interface/MenuCursor.h>
 #include <OverlayRenderHandlerD3D11.hpp>
 
 #include <Systems/RenderSystemD3D11.h>
+#include <Systems/UiRules.h>
 
 #include <World.h>
 
 #include <Services/OverlayClient.h>
 #include <Services/TransportService.h>
+#include <Services/HelgenService.h>
 
 #include <Messages/NotifyChatMessageBroadcast.h>
 #include <Messages/NotifyPlayerList.h>
@@ -35,6 +39,7 @@
 #include <Events/PartyLeftEvent.h>
 
 #include <PlayerCharacter.h>
+#include <Interface/UI.h>
 #include <Forms/TESWorldSpace.h>
 #include <Forms/TESObjectCELL.h>
 #include <Games/ActorExtension.h>
@@ -159,6 +164,87 @@ void OverlayService::Render() noexcept
     else if (!inGame && m_inGame)
         SetInGame(false);
 
+    const auto* ui = UI::Get();
+    const auto anyMenuOpen = [ui](const auto& acMenus) {
+        return std::any_of(acMenus.begin(), acMenus.end(), [ui](const char* apMenu) { return ui->GetMenuOpen(BSFixedString(apMenu)); });
+    };
+    const bool inWorld = inGame && ui && !ui->GetMenuOpen(BSFixedString("Loading Menu")) && !ui->GetMenuOpen(BSFixedString("Main Menu"));
+    const bool shortcut = inWorld && anyMenuOpen(UiRules::kMenuShortcutMenus);
+    const bool fullscreenMenu = inWorld && anyMenuOpen(UiRules::kFullscreenMenus);
+    if (fullscreenMenu != m_fullscreenMenu)
+    {
+        m_fullscreenMenu = fullscreenMenu;
+        auto args = CefListValue::Create();
+        args->SetBool(0, fullscreenMenu);
+        m_pOverlay->ExecuteAsync("openingMenu", args);
+    }
+    auto renderer = m_pOverlay->GetClient()->GetOverlayRenderHandler();
+    // The view size is locked until the renderer first knows the screen, which is long before the player is in game.
+    // Asking any earlier blocks this render thread for good.
+    if (inGame)
+    {
+        CefRect viewport;
+        renderer->GetViewRect(nullptr, viewport);
+        m_viewHeight = viewport.height;
+    }
+
+    // The page draws the strip ahead of time, from the menu's show message on (see PrepareMenuShortcut), and it stays
+    // out of the picture until the menu is up. The strip then appears in the same frame as the menu, and goes with it.
+    const auto now = std::chrono::steady_clock::now();
+    if (shortcut)
+    {
+        renderer->ClearHiddenRegion();
+        ShowMenuShortcut(true);
+        m_stripHiddenUntil = {};
+    }
+    else
+    {
+        if (m_menuShortcut)
+        {
+            ShowMenuShortcut(false);
+            // Covers the browser's repaint without the strip
+            m_stripHiddenUntil = now + 300ms;
+            if (!m_active)
+                TiltedPhoques::DInputHook::Get().SetEnabled(false);
+        }
+        // A show message for a menu that then never opened
+        else if (m_stripPainted && now - m_stripPreparedAt.load() > 1s)
+        {
+            ShowMenuShortcut(false);
+            m_stripHiddenUntil = now + 300ms;
+        }
+
+        if (m_stripPainted || now < m_stripHiddenUntil)
+        {
+            const auto rect = UiRules::MenuShortcutRect(m_viewHeight);
+            renderer->SetHiddenRegion(rect.X, rect.Y, rect.Width, rect.Height);
+        }
+        else
+            renderer->ClearHiddenRegion();
+    }
+    m_menuShortcut = shortcut;
+
+    // The game's cursor is drawn before CEF. Draw its overlay counterpart over the strip, which is opaque so it hides the
+    // game's cursor under it.
+    if (!m_active)
+    {
+        const auto* cursor = MenuCursor::Get();
+        bool overStrip = false;
+        if (shortcut && cursor && cursor->width > 0 && cursor->height > 0)
+        {
+            CefRect viewport;
+            renderer->GetViewRect(nullptr, viewport);
+            const float x = cursor->x * viewport.width / cursor->width;
+            const float y = cursor->y * viewport.height / cursor->height;
+            if (x >= 0 && x <= UINT16_MAX && y >= 0 && y <= UINT16_MAX)
+            {
+                overStrip = IsMenuShortcut(static_cast<uint16_t>(x), static_cast<uint16_t>(y));
+                if (overStrip)
+                    renderer->SetCursorLocation(static_cast<uint16_t>(x), static_cast<uint16_t>(y));
+            }
+        }
+        renderer->SetCursorVisible(overStrip);
+    }
     m_pOverlay->GetClient()->Render();
 }
 
@@ -185,8 +271,12 @@ void OverlayService::Initialize() noexcept
 
 void OverlayService::SetActive(bool aActive) noexcept
 {
-    if (!m_inGame)
-        return;
+    aActive = aActive && m_inGame;
+    // Keep capture and visibility together, including when returning to the main menu.
+    TiltedPhoques::DInputHook::Get().SetEnabled(aActive);
+    if (m_pOverlay)
+        m_pOverlay->GetClient()->GetOverlayRenderHandler()->SetCursorVisible(aActive);
+
     if (m_active == aActive)
         return;
 
@@ -198,6 +288,35 @@ void OverlayService::SetActive(bool aActive) noexcept
 bool OverlayService::GetActive() const noexcept
 {
     return m_active;
+}
+
+bool OverlayService::IsMenuShortcut(uint16_t aX, uint16_t aY) const noexcept
+{
+    // Bounds match .multiplayer-shortcut, independent of the UI font-size setting.
+    return m_menuShortcut && !m_active && UiRules::MenuShortcutRect(m_viewHeight).Contains(aX, aY);
+}
+
+void OverlayService::PrepareMenuShortcut(const BSFixedString& acMenu) noexcept
+{
+    if (!m_pOverlay || !m_inGame)
+        return;
+
+    const char* name = acMenu.AsAscii();
+    if (!name || std::none_of(UiRules::kMenuShortcutMenus.begin(), UiRules::kMenuShortcutMenus.end(), [name](const char* apMenu) { return _stricmp(apMenu, name) == 0; }))
+        return;
+
+    m_stripPreparedAt = std::chrono::steady_clock::now();
+    ShowMenuShortcut(true);
+}
+
+void OverlayService::ShowMenuShortcut(bool aShow) noexcept
+{
+    if (m_stripPainted.exchange(aShow) == aShow)
+        return;
+
+    auto args = CefListValue::Create();
+    args->SetBool(0, aShow);
+    m_pOverlay->ExecuteAsync("menuShortcut", args);
 }
 
 void OverlayService::SetInGame(bool aInGame) noexcept
@@ -214,7 +333,6 @@ void OverlayService::SetInGame(bool aInGame) noexcept
     else
     {
         m_pOverlay->ExecuteAsync("exitGame");
-        // TODO: this does nothing, since m_inGame is false
         SetActive(false);
     }
 }
@@ -277,6 +395,24 @@ void OverlayService::SetPlayerHealthPercentage(uint32_t aFormId) const noexcept
 
 void OverlayService::OnUpdate(const UpdateEvent&) noexcept
 {
+    if (m_pOverlay && std::chrono::steady_clock::now() >= m_nextHostUpdate)
+    {
+        m_nextHostUpdate = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        const auto status = m_hostSession.GetStatus();
+        if (status.Revision != m_hostRevision)
+        {
+            m_hostRevision = status.Revision;
+            if (status.State == "error" && !m_transport.IsConnected())
+                m_world.ctx().at<HelgenService>().Cancel();
+            auto args = CefListValue::Create();
+            args->SetString(0, status.State);
+            args->SetString(1, status.Message);
+            args->SetString(2, status.Address);
+            args->SetString(3, status.LanAddress);
+            args->SetInt(4, status.Port);
+            m_pOverlay->ExecuteAsync("hostStatus", args);
+        }
+    }
     RunDebugDataUpdates();
     RunPlayerHealthUpdates();
 }
@@ -402,29 +538,8 @@ void OverlayService::OnPlayerCellChanged(const NotifyPlayerCellChanged& acMessag
 
 void OverlayService::OnNotifyTeleport(const NotifyTeleport& acMessage) noexcept
 {
-    auto& modSystem = m_world.GetModSystem();
-
-    const uint32_t cellId = modSystem.GetGameId(acMessage.CellId);
-    TESObjectCELL* pCell = Cast<TESObjectCELL>(TESForm::GetById(cellId));
-    if (!pCell)
-    {
-        const uint32_t worldSpaceId = modSystem.GetGameId(acMessage.WorldSpaceId);
-        TESWorldSpace* pWorldSpace = Cast<TESWorldSpace>(TESForm::GetById(worldSpaceId));
-        if (pWorldSpace)
-        {
-            GridCellCoords coordinates = GridCellCoords::CalculateGridCellCoords(acMessage.Position);
-            pCell = pWorldSpace->LoadCell(coordinates.X, coordinates.Y);
-        }
-
-        if (!pCell)
-        {
-            spdlog::error("Failed to fetch cell to teleport to.");
-            m_world.GetOverlayService().SendSystemMessage("Teleporting to player failed.");
-            return;
-        }
-    }
-
-    PlayerCharacter::Get()->MoveTo(pCell, acMessage.Position);
+    if (!m_world.GetCharacterService().MoveActor(PlayerCharacter::Get(), acMessage.WorldSpaceId, acMessage.CellId, acMessage.Position))
+        m_world.GetOverlayService().SendSystemMessage("Teleporting to player failed. Wait for the target to finish loading, then retry.");
 }
 
 void OverlayService::OnNotifyPlayerHealthUpdate(const NotifyPlayerHealthUpdate& acMessage) noexcept

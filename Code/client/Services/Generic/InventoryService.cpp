@@ -8,10 +8,15 @@
 #include <Messages/NotifyEquipmentChanges.h>
 #include <Messages/DrawWeaponRequest.h>
 #include <Messages/NotifyDrawWeapon.h>
+#include <Messages/DroppedItems.h>
 
 #include <Events/UpdateEvent.h>
 #include <Events/InventoryChangeEvent.h>
 #include <Events/EquipmentChangeEvent.h>
+#include <Events/DroppedItemEvent.h>
+#include <Events/DroppedItemPickUpEvent.h>
+#include <Events/DisconnectedEvent.h>
+#include <Events/CellChangeEvent.h>
 
 #include <World.h>
 #include <Games/Skyrim/Interface/UI.h>
@@ -25,7 +30,21 @@
 #include <EquipManager.h>
 #include <Games/ActorExtension.h>
 #include <Forms/TESNPC.h>
+#include <Forms/TESBoundObject.h>
 #include <DefaultObjectManager.h>
+#include <Systems/DropRules.h>
+#include <Systems/SyncRules.h>
+
+namespace
+{
+void RemoveDropReference(TESObjectREFR* apReference) noexcept
+{
+    apReference->DisableImpl();
+
+    if (apReference->IsTemporary())
+        apReference->Delete();
+}
+} // namespace
 
 InventoryService::InventoryService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
     : m_world(aWorld)
@@ -33,6 +52,12 @@ InventoryService::InventoryService(World& aWorld, entt::dispatcher& aDispatcher,
     , m_transport(aTransport)
 {
     m_updateConnection = m_dispatcher.sink<UpdateEvent>().connect<&InventoryService::OnUpdate>(this);
+    m_droppedItemConnection = m_dispatcher.sink<DroppedItemEvent>().connect<&InventoryService::OnDroppedItem>(this);
+    m_droppedItemPickUpConnection = m_dispatcher.sink<DroppedItemPickUpEvent>().connect<&InventoryService::OnDroppedItemPickUp>(this);
+    m_disconnectedConnection = m_dispatcher.sink<DisconnectedEvent>().connect<&InventoryService::OnDisconnected>(this);
+    m_cellChangeConnection = m_dispatcher.sink<CellChangeEvent>().connect<&InventoryService::OnCellChange>(this);
+    m_notifyDroppedItemsConnection = m_dispatcher.sink<NotifyDroppedItems>().connect<&InventoryService::OnNotifyDroppedItems>(this);
+    m_notifyDroppedItemRemovedConnection = m_dispatcher.sink<NotifyDroppedItemRemoved>().connect<&InventoryService::OnNotifyDroppedItemRemoved>(this);
     m_inventoryConnection = m_dispatcher.sink<InventoryChangeEvent>().connect<&InventoryService::OnInventoryChangeEvent>(this);
     m_equipmentConnection = m_dispatcher.sink<EquipmentChangeEvent>().connect<&InventoryService::OnEquipmentChangeEvent>(this);
     m_inventoryChangeConnection = m_dispatcher.sink<NotifyInventoryChanges>().connect<&InventoryService::OnNotifyInventoryChanges>(this);
@@ -42,6 +67,304 @@ InventoryService::InventoryService(World& aWorld, entt::dispatcher& aDispatcher,
 void InventoryService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
 {
     RunWeaponStateUpdates();
+    RunDropChecks();
+    RunSharedDropUpdates();
+}
+
+void InventoryService::OnDroppedItem(const DroppedItemEvent& acEvent) noexcept
+{
+    m_dropChecks.push_back({acEvent.Handle, acEvent.CellId, acEvent.ExpectedPosition, std::chrono::steady_clock::now() + 5s, 0, acEvent.Item});
+}
+
+void InventoryService::RunDropChecks() noexcept
+{
+    if (m_dropChecks.empty())
+        return;
+
+    constexpr uint32_t cMaxCorrections = 3;
+    const auto cNow = std::chrono::steady_clock::now();
+
+    std::erase_if(m_dropChecks, [this, cNow](DropCheck& aItem) {
+        auto* pItem = TESObjectREFR::GetByHandle(aItem.Handle);
+        auto* pCell = Cast<TESObjectCELL>(TESForm::GetById(aItem.CellId));
+
+        // Handles go stale when an item gets picked up, the rest of the time it's safe to leave it alone
+        if (!pItem || !pCell || cNow >= aItem.Deadline || aItem.Corrections >= cMaxCorrections)
+            return true;
+
+        if (SyncRules::IsDropMisplaced(pItem->position, aItem.ExpectedPosition))
+        {
+            spdlog::warn("Dropped item {:X} landed at ({}, {}, {}), moving it to ({}, {}, {})", pItem->formID, pItem->position.x, pItem->position.y, pItem->position.z, aItem.ExpectedPosition.x, aItem.ExpectedPosition.y, aItem.ExpectedPosition.z);
+
+            // MoveTo() disables and enables anything that isn't an actor, which throws away the 3D of a physics object and
+            // leaves building a new one to a queue. Only an item with nothing to lose can go through there.
+            if (pItem->GetNiNode())
+                pItem->WarpTo(aItem.ExpectedPosition);
+            else
+                pItem->MoveTo(pCell, aItem.ExpectedPosition);
+
+            ++aItem.Corrections;
+        }
+
+        if (aItem.Item.Count > 0)
+        {
+            ShareDrop(*pItem, *pCell, aItem.Item);
+            aItem.Item.Count = 0;
+        }
+
+        return false;
+    });
+}
+
+void InventoryService::ShareDrop(const TESObjectREFR& acItem, const TESObjectCELL& acCell, const Inventory::Entry& acEntry) noexcept
+{
+    if (!m_transport.IsConnected())
+        return;
+
+    auto& modSystem = m_world.GetModSystem();
+
+    RequestItemDrop request;
+    request.Item.Item = acEntry;
+    request.Item.Position = acItem.position;
+    request.Item.Coords = GridCellCoords::CalculateGridCellCoords(acItem.position.x, acItem.position.y);
+
+    if (!modSystem.GetServerModId(acCell.formID, request.Item.CellId))
+    {
+        spdlog::error("Server cell id not found for cell form id {:X}", acCell.formID);
+        return;
+    }
+
+    if (!(acCell.cellFlags & 1) && !modSystem.GetServerModId(acCell.worldspace->formID, request.Item.WorldSpaceId))
+    {
+        spdlog::error("Server world space id not found for world space form id {:X}", acCell.worldspace->formID);
+        return;
+    }
+
+    const uint32_t cHandle = acItem.GetHandle().handle.iBits;
+
+    request.Item.Cookie = m_nextDropCookie++;
+    m_pendingDrops[request.Item.Cookie] = cHandle;
+    SetSharedReference(cHandle, 0);
+
+    m_transport.Send(request);
+
+    spdlog::info("Sharing dropped item {:X}, item: {:X}, count: {}", acItem.formID, acEntry.BaseId.BaseId, acEntry.Count);
+}
+
+bool InventoryService::IsSharedDrop(const TESObjectREFR* apObject) const noexcept
+{
+    if (!apObject)
+        return false;
+
+    const uint32_t cHandle = apObject->GetHandle().handle.iBits;
+
+    std::scoped_lock _{m_sharedReferencesLock};
+    return m_sharedReferences.find(cHandle) != m_sharedReferences.end();
+}
+
+bool InventoryService::DeferDropPickUp(const TESObjectREFR* apObject, int32_t aCount, bool aUnk1, bool aUnk2) noexcept
+{
+    if (!IsSharedDrop(apObject))
+        return false;
+
+    World::Get().GetRunner().Trigger(DroppedItemPickUpEvent(apObject->GetHandle().handle.iBits, aCount, aUnk1, aUnk2));
+    return true;
+}
+
+void InventoryService::SetSharedReference(uint32_t aHandle, uint32_t aDropId) noexcept
+{
+    std::scoped_lock _{m_sharedReferencesLock};
+    m_sharedReferences[aHandle] = aDropId;
+}
+
+void InventoryService::ForgetSharedReference(uint32_t aHandle) noexcept
+{
+    std::scoped_lock _{m_sharedReferencesLock};
+    m_sharedReferences.erase(aHandle);
+}
+
+void InventoryService::OnDroppedItemPickUp(const DroppedItemPickUpEvent& acEvent) noexcept
+{
+    const auto it = std::find_if(m_sharedDrops.begin(), m_sharedDrops.end(), [&acEvent](const SharedDrop& acDrop) { return acDrop.Handle == acEvent.Handle; });
+
+    // The item has no ID until the server has answered the dropper. That takes less time than closing the inventory does.
+    if (it == m_sharedDrops.end() || it->PickUpRequested)
+        return;
+
+    it->PickUpRequested = true;
+    it->PickUpCount = acEvent.Count;
+    it->PickUpUnk1 = acEvent.Unk1;
+    it->PickUpUnk2 = acEvent.Unk2;
+
+    RequestDroppedItemPickUp request;
+    request.Id = it->Data.Id;
+
+    m_transport.Send(request);
+}
+
+void InventoryService::OnNotifyDroppedItems(const NotifyDroppedItems& acMessage) noexcept
+{
+    for (const DroppedItem& item : acMessage.Items)
+    {
+        if (std::any_of(m_sharedDrops.begin(), m_sharedDrops.end(), [&item](const SharedDrop& acDrop) { return acDrop.Data.Id == item.Id; }))
+            continue;
+
+        SharedDrop drop{item, 0, false, false, 0, false, false};
+
+        if (const auto it = m_pendingDrops.find(item.Cookie); it != m_pendingDrops.end())
+        {
+            drop.Handle = it->second;
+            drop.IsOwnReference = true;
+            SetSharedReference(drop.Handle, item.Id);
+            m_pendingDrops.erase(it);
+        }
+
+        m_sharedDrops.push_back(std::move(drop));
+    }
+
+    m_nextSharedDropUpdate = {};
+}
+
+void InventoryService::OnNotifyDroppedItemRemoved(const NotifyDroppedItemRemoved& acMessage) noexcept
+{
+    const auto it = std::find_if(m_sharedDrops.begin(), m_sharedDrops.end(), [&acMessage](const SharedDrop& acDrop) { return acDrop.Data.Id == acMessage.Id; });
+    if (it == m_sharedDrops.end())
+        return;
+
+    const SharedDrop drop = std::move(*it);
+    m_sharedDrops.erase(it);
+
+    // No longer shared, which is also what lets the pick up below through
+    ForgetSharedReference(drop.Handle);
+
+    TESObjectREFR* pReference = drop.Handle ? TESObjectREFR::GetByHandle(drop.Handle) : nullptr;
+
+    if (!acMessage.Granted)
+    {
+        if (pReference)
+            RemoveDropReference(pReference);
+
+        return;
+    }
+
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+
+    if (pReference && DropRules::CanPickUpReference(drop.IsOwnReference, drop.Data.Item.ContainsExtraData()))
+    {
+        pPlayer->PickUpSharedDrop(pReference, drop.PickUpCount, drop.PickUpUnk1, drop.PickUpUnk2);
+        return;
+    }
+
+    if (pReference)
+        RemoveDropReference(pReference);
+
+    {
+        ScopedInventoryOverride _;
+        pPlayer->AddOrRemoveItem(drop.Data.Item);
+    }
+
+    if (const auto cToken = Utils::GetLocalOwnershipToken(pPlayer->formID))
+    {
+        InventoryChangeEvent event(pPlayer->formID, drop.Data.Item);
+        event.ServerId = cToken->ServerId;
+        event.OwnershipEpoch = cToken->OwnershipEpoch;
+        OnInventoryChangeEvent(event);
+    }
+}
+
+void InventoryService::OnCellChange(const CellChangeEvent& acEvent) noexcept
+{
+    if (!m_transport.IsConnected())
+        return;
+
+    RequestDroppedItems request;
+    request.CellId = acEvent.CellId;
+    request.WorldSpaceId = acEvent.WorldSpaceId;
+    request.Coords = acEvent.CurrentCoords;
+
+    m_transport.Send(request);
+}
+
+void InventoryService::OnDisconnected(const DisconnectedEvent& acEvent) noexcept
+{
+    // The dropper's references stay, as ordinary items. Without a server nothing stops a copy being taken as well.
+    for (const SharedDrop& drop : m_sharedDrops)
+    {
+        if (drop.IsOwnReference || !drop.Handle)
+            continue;
+
+        if (TESObjectREFR* pReference = TESObjectREFR::GetByHandle(drop.Handle))
+            RemoveDropReference(pReference);
+    }
+
+    m_sharedDrops.clear();
+    m_pendingDrops.clear();
+
+    std::scoped_lock _{m_sharedReferencesLock};
+    m_sharedReferences.clear();
+}
+
+void InventoryService::RunSharedDropUpdates() noexcept
+{
+    if (m_sharedDrops.empty())
+        return;
+
+    const auto cNow = std::chrono::steady_clock::now();
+    if (cNow < m_nextSharedDropUpdate)
+        return;
+
+    m_nextSharedDropUpdate = cNow + 1s;
+
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    TESObjectCELL* pCell = pPlayer->GetParentCellEx();
+    if (!pCell)
+        return;
+
+    auto& modSystem = m_world.GetModSystem();
+    TESWorldSpace* pWorldSpace = pPlayer->GetWorldSpace();
+
+    GameId cellId{};
+    GameId worldSpaceId{};
+    if (!modSystem.GetServerModId(pCell->formID, cellId) || (pWorldSpace && !modSystem.GetServerModId(pWorldSpace->formID, worldSpaceId)))
+        return;
+
+    for (SharedDrop& drop : m_sharedDrops)
+    {
+        if (drop.Handle)
+        {
+            if (TESObjectREFR::GetByHandle(drop.Handle))
+                continue;
+
+            // Cells forget temporary references when they unload. The item is still out there, so it can come back as a copy.
+            ForgetSharedReference(drop.Handle);
+            drop.Handle = 0;
+            drop.IsOwnReference = false;
+            drop.PickUpRequested = false;
+        }
+
+        const DroppedItem& item = drop.Data;
+        if (!DropRules::ShouldShowDrop(!item.WorldSpaceId, item.CellId == cellId, item.WorldSpaceId == worldSpaceId, item.Position, pPlayer->position))
+            continue;
+
+        auto* pObject = Cast<TESBoundObject>(TESForm::GetById(modSystem.GetGameId(item.Item.BaseId)));
+        if (!pObject)
+        {
+            spdlog::debug("Dropped item {:X}:{:X} doesn't exist on this client", item.Item.BaseId.ModId, item.Item.BaseId.BaseId);
+            continue;
+        }
+
+        TESObjectREFR* pReference = TESObjectREFR::PlaceItem(pObject, item.Item.Count, pCell, pWorldSpace, item.Position);
+        if (!pReference)
+        {
+            spdlog::warn("Failed to place dropped item {:X} at ({}, {}, {})", pObject->formID, item.Position.x, item.Position.y, item.Position.z);
+            continue;
+        }
+
+        drop.Handle = pReference->GetHandle().handle.iBits;
+        SetSharedReference(drop.Handle, item.Id);
+
+        spdlog::info("Placed dropped item {:X} as {:X} at ({}, {}, {})", pObject->formID, pReference->formID, item.Position.x, item.Position.y, item.Position.z);
+    }
 }
 
 void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept

@@ -12,8 +12,14 @@
 #include <Services/ImguiService.h>
 #include <Services/DiscordService.h>
 #include <World.h>
+#include <Playtest.h>
+#include <Systems/UiRules.h>
+
+#include <thread>
 
 #include "Games/Skyrim/Interface/MenuControls.h"
+#include <Interface/MenuCursor.h>
+#include <BSGraphics/BSGraphicsRenderer.h>
 
 static OverlayService* s_pOverlay = nullptr;
 static UINT s_currentACP = CP_ACP;
@@ -97,16 +103,13 @@ bool IsDisableKey(int aKey) noexcept
     return aKey == VK_ESCAPE;
 }
 
-void SetUIActive(OverlayService& aOverlay, auto apRenderer, bool aActive)
+void SetUIActive(OverlayService& aOverlay, bool aActive)
 {
-    TiltedPhoques::DInputHook::Get().SetEnabled(aActive);
     aOverlay.SetActive(aActive);
 
     // Ensures the game is actually loaded, in case the initial event was sent too early
     aOverlay.SetVersion(BUILD_COMMIT);
     aOverlay.GetOverlayApp()->ExecuteAsync("enterGame");
-
-    apRenderer->SetCursorVisible(aActive);
 
     // This is to disable the Windows cursor
     while (ShowCursor(FALSE) >= 0)
@@ -199,7 +202,7 @@ void ProcessKeyboard(uint16_t aKey, uint16_t aScanCode, cef_key_event_type_t aTy
         }
         else if (aType == KEYEVENT_KEYUP)
         {
-            SetUIActive(overlay, pRenderer, !active);
+            SetUIActive(overlay, !active);
         }
     }
     else if (active)
@@ -232,6 +235,35 @@ void ProcessMouseMove(uint16_t aX, uint16_t aY)
     }
 }
 
+bool InputService::OpenMenuShortcutAt(uint16_t aX, uint16_t aY)
+{
+    if (!s_pOverlay || !s_pOverlay->IsMenuShortcut(aX, aY))
+        return false;
+    SetUIActive(*s_pOverlay, true);
+    auto* app = s_pOverlay->GetOverlayApp();
+    app->InjectMouseMove(aX, aY, 0);
+    app->InjectMouseButton(aX, aY, MBT_LEFT, false, 0);
+    app->InjectMouseButton(aX, aY, MBT_LEFT, true, 0);
+    return true;
+}
+
+static bool OpenMenuShortcut()
+{
+    auto* window = BSGraphics::GetMainWindow();
+    const auto* cursor = MenuCursor::Get();
+    if (!window || !window->IsForeground() || Playtest::Active() || !s_pOverlay || !s_pOverlay->GetInGame() ||
+        !cursor || cursor->width <= 0 || cursor->height <= 0)
+        return false;
+    CefRect viewport;
+    s_pOverlay->GetOverlayApp()->GetClient()->GetOverlayRenderHandler()->GetViewRect(nullptr, viewport);
+    const float x = cursor->x * viewport.width / cursor->width;
+    const float y = cursor->y * viewport.height / cursor->height;
+    if (x < 0 || y < 0 || x > UINT16_MAX || y > UINT16_MAX ||
+        !InputService::OpenMenuShortcutAt(static_cast<uint16_t>(x), static_cast<uint16_t>(y)))
+        return false;
+    return true;
+}
+
 void ProcessMouseButton(uint16_t aX, uint16_t aY, cef_mouse_button_type_t aButton, bool aDown)
 {
     auto& overlay = *s_pOverlay;
@@ -249,6 +281,11 @@ void ProcessMouseButton(uint16_t aX, uint16_t aY, cef_mouse_button_type_t aButto
         return;
 
     const auto active = overlay.GetActive();
+
+    if (!active && aButton == MBT_LEFT && aDown && InputService::OpenMenuShortcutAt(aX, aY))
+    {
+        return;
+    }
 
     if (active)
     {
@@ -298,8 +335,176 @@ UINT GetRealACP()
     return acp;
 }
 
+static constexpr UINT_PTR kCursorTimerId = 0x5A7;
+
+using TShowCursor = int(WINAPI*)(BOOL);
+static TShowCursor RealShowCursor = nullptr;
+
+static bool GameIsForeground()
+{
+    auto* window = BSGraphics::GetMainWindow();
+    return window && window->IsForeground();
+}
+
+// Skyrim and CEF render their own cursors; suppress the detached Windows pointer while the game is focused.
+// Returning 0 preserves Skyrim's visible-cursor state without making ShowCursor's OS pointer visible.
+static int WINAPI HookShowCursor(BOOL aShow)
+{
+    if (!RealShowCursor)
+        return 0;
+    if (!aShow)
+        return RealShowCursor(aShow);
+
+    if (!GameIsForeground())
+        return RealShowCursor(aShow);
+
+    RealShowCursor(FALSE);
+    return 0;
+}
+
+// Skyrim stops delivering WM_SETCURSOR once the pointer is hidden, so the only reliable way to notice a
+// cursor that came back is to poll. ShowCursor is thread-local: this must run on the window thread.
+static void NormalizeCursor()
+{
+    if (!GameIsForeground())
+        return;
+
+    CURSORINFO info{sizeof(CURSORINFO)};
+    if (!GetCursorInfo(&info))
+        return;
+
+    const bool shown = (info.flags & CURSOR_SHOWING) != 0;
+    if (!shown)
+        return;
+
+    while (RealShowCursor(FALSE) >= 0)
+        ;
+}
+
+static bool s_cursorClipped = false;
+static bool s_movingWindow = false;
+
+static void ReleaseCursorClip()
+{
+    if (!s_cursorClipped)
+        return;
+
+    // Unconditional calls would pull the clip out from under a second instance that has focus.
+    s_cursorClipped = false;
+    ClipCursor(nullptr);
+}
+
+// The game reads relative mouse input, so the hidden Windows pointer otherwise roams over every monitor, hovering
+// whatever is there, and a click out there lands on that window. Windows and DirectInput both drop the clip on their
+// own (focus changes, Unacquire), so this runs on the cursor timer and restores it rather than setting it once.
+static void UpdateCursorClip(HWND aHwnd)
+{
+    if (!UiRules::ShouldClipCursor(GameIsForeground(), IsIconic(aHwnd) != FALSE, s_movingWindow, Playtest::Active()))
+    {
+        ReleaseCursorClip();
+        return;
+    }
+
+    RECT client;
+    if (!GetClientRect(aHwnd, &client) || IsRectEmpty(&client))
+        return;
+    MapWindowPoints(aHwnd, nullptr, reinterpret_cast<POINT*>(&client), 2);
+
+    RECT current;
+    if (s_cursorClipped && GetClipCursor(&current) && EqualRect(&current, &client))
+        return;
+
+    s_cursorClipped = ClipCursor(&client) != FALSE;
+}
+
+static bool AffectsCursorClip(UINT aMessage, WPARAM aWParam)
+{
+    switch (aMessage)
+    {
+    case WM_TIMER: return aWParam == kCursorTimerId;
+    case WM_ACTIVATE:
+    case WM_ACTIVATEAPP:
+    case WM_KILLFOCUS:
+    case WM_SETFOCUS:
+    case WM_SIZE:
+    case WM_MOVE:
+    case WM_DISPLAYCHANGE:
+    case WM_ENTERSIZEMOVE:
+    case WM_EXITSIZEMOVE: return true;
+    default: return false;
+    }
+}
+
+// Runs on its own thread: a low-level hook on the game thread would freeze the whole desktop's keyboard during a hitch.
+static LRESULT CALLBACK SystemKeyHook(int aCode, WPARAM aWParam, LPARAM aLParam)
+{
+    static DWORD s_altDownTime = 0;
+
+    if (aCode != HC_ACTION)
+        return CallNextHookEx(nullptr, aCode, aWParam, aLParam);
+
+    const auto* pKey = reinterpret_cast<const KBDLLHOOKSTRUCT*>(aLParam);
+    const bool keyDown = aWParam == WM_KEYDOWN || aWParam == WM_SYSKEYDOWN;
+    if (pKey->vkCode == VK_LMENU || pKey->vkCode == VK_RMENU)
+    {
+        if (!keyDown)
+            s_altDownTime = 0;
+        else if (!s_altDownTime)
+            s_altDownTime = pKey->time;
+    }
+
+    bool block = false;
+    if (GameIsForeground() && s_pOverlay && !s_pOverlay->GetActive() && !Playtest::Active())
+    {
+        const bool altDown = (pKey->flags & LLKHF_ALTDOWN) != 0;
+        const bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        const DWORD altHeld = s_altDownTime ? pKey->time - s_altDownTime : 0;
+        block = UiRules::ShouldBlockSystemKey(pKey->vkCode, keyDown, altDown, ctrlDown, altHeld);
+    }
+
+    // The rest of the chain includes DirectInput's own hook, which still has to see the key for the game.
+    const LRESULT result = CallNextHookEx(nullptr, aCode, aWParam, aLParam);
+    return block ? 1 : result;
+}
+
+static void RunSystemKeyHook()
+{
+    HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, &SystemKeyHook, GetModuleHandleW(nullptr), 0);
+    if (!hook)
+    {
+        spdlog::warn("Could not install the system key hook, error {}", GetLastError());
+        return;
+    }
+
+    MSG message;
+    while (GetMessageW(&message, nullptr, 0, 0) > 0)
+    {
+    }
+    UnhookWindowsHookEx(hook);
+}
+
 LRESULT CALLBACK InputService::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+    static bool s_cursorTimer = false;
+    if (!s_cursorTimer)
+    {
+        SetTimer(hwnd, kCursorTimerId, 15, nullptr);
+        s_cursorTimer = true;
+    }
+
+    if (uMsg == WM_ENTERSIZEMOVE)
+        s_movingWindow = true;
+    else if (uMsg == WM_EXITSIZEMOVE)
+        s_movingWindow = false;
+
+    if (uMsg == WM_DESTROY)
+        ReleaseCursorClip();
+    else if (AffectsCursorClip(uMsg, wParam))
+        UpdateCursorClip(hwnd);
+
+    // Virtual input is delivered directly; physical input must not move its cursor.
+    if (Playtest::Active())
+        return 0;
     const auto pApp = s_pOverlay->GetOverlayApp();
     if (!pApp)
         return 0;
@@ -322,12 +527,34 @@ LRESULT CALLBACK InputService::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
         imgui.WndProcHandler(hwnd, uMsg, wParam, lParam);
     }
 
+    if (uMsg == WM_TIMER && wParam == kCursorTimerId)
+    {
+        NormalizeCursor();
+        return 0;
+    }
+
+    // Skyrim and CEF draw their own cursor; keep the detached Windows pointer hidden over the game window.
+    if (uMsg == WM_SETCURSOR && GameIsForeground())
+    {
+        ::SetCursor(nullptr);
+        while (RealShowCursor(FALSE) >= 0)
+            ;
+        return 1;
+    }
+
     POINT position;
 
     GetCursorPos(&position);
-    ScreenToClient(GetActiveWindow(), &position);
+    ScreenToClient(hwnd, &position);
 
     ProcessMouseMove(static_cast<uint16_t>(position.x), static_cast<uint16_t>(position.y));
+
+    // Windowed/absolute mouse input can click between game polls, before raw input is enabled.
+    if (uMsg == WM_LBUTTONDOWN && !active && position.x >= 0 && position.y >= 0 &&
+        OpenMenuShortcutAt(static_cast<uint16_t>(position.x), static_cast<uint16_t>(position.y)))
+    {
+        return 1;
+    }
 
     if (uMsg == WM_INPUT)
     {
@@ -404,9 +631,7 @@ LRESULT CALLBACK InputService::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
     // When player tabs in, force the UI state
     else if (uMsg == WM_SETFOCUS && s_pOverlay->GetActive())
     {
-        TiltedPhoques::DInputHook::Get().SetEnabled(true);
         s_pOverlay->SetActive(true);
-        pRenderer->SetCursorVisible(true);
     }
     else if (uMsg == WM_INPUTLANGCHANGE)
     {
@@ -420,10 +645,18 @@ LRESULT CALLBACK InputService::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 InputService::InputService(OverlayService& aOverlay) noexcept
 {
     s_pOverlay = &aOverlay;
+    TiltedPhoques::DInputHook::Get().OnLeftMousePress = OpenMenuShortcut;
     s_currentACP = GetRealACP();
+    TP_HOOK_IAT(ShowCursor, "user32.dll");
+
+    // Windows swaps a game that stops pumping messages for 5s for a ghost window, which takes the foreground away.
+    DisableProcessWindowsGhosting();
+    std::thread(RunSystemKeyHook).detach();
 }
 
 InputService::~InputService() noexcept
 {
+    TiltedPhoques::DInputHook::Get().OnLeftMousePress = nullptr;
+    ReleaseCursorClip();
     s_pOverlay = nullptr;
 }

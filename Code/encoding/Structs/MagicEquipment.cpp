@@ -36,6 +36,8 @@ void MagicEquipment::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noe
 
 void MagicEquipment::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
 {
+    *this = {};
+
     bool isLeftSpellSet = Serialization::ReadBool(aReader);
     bool isRightSpellSet = Serialization::ReadBool(aReader);
     bool isShoutSet = Serialization::ReadBool(aReader);

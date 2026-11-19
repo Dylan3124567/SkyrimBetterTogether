@@ -35,6 +35,12 @@ void WeatherService::OnDisconnected(const DisconnectedEvent& acEvent) noexcept
     ToggleGameWeatherSystem(true);
 }
 
+void WeatherService::OnPartyLeaderChanged() noexcept
+{
+    ToggleGameWeatherSystem(true);
+    OnPartyJoinedEvent(PartyJoinedEvent(m_world.GetPartyService().IsLeader()));
+}
+
 void WeatherService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept
 {
     if (!acEvent.IsLeader)
@@ -131,7 +137,8 @@ void WeatherService::OnWeatherChange(const NotifyWeatherChange& acMessage) noexc
         return;
     }
 
-    Sky::Get()->ForceWeather(pWeather);
+    if (auto* pSky = Sky::Get())
+        pSky->ForceWeather(pWeather);
 
     m_cachedWeatherId = weatherId;
 }
@@ -185,7 +192,10 @@ void WeatherService::RunWeatherUpdates(const double acDelta) noexcept
 void WeatherService::ToggleGameWeatherSystem(bool aToggle) noexcept
 {
     if (aToggle)
-        Sky::Get()->ReleaseWeatherOverride();
+    {
+        if (auto* pSky = Sky::Get())
+            pSky->ReleaseWeatherOverride();
+    }
     else
         m_transport.Send(RequestCurrentWeather());
 
@@ -205,5 +215,6 @@ void WeatherService::SetCachedWeather() noexcept
         return;
     }
 
-    Sky::Get()->ForceWeather(pWeather);
+    if (auto* pSky = Sky::Get())
+        pSky->ForceWeather(pWeather);
 }

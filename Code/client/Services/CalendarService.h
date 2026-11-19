@@ -5,6 +5,7 @@
 #include <Games/Events.h>
 
 struct ServerTimeSettings;
+struct NotifySleep;
 struct DisconnectedEvent;
 struct World;
 struct UpdateEvent;
@@ -24,6 +25,8 @@ private:
     void OnTimeUpdate(const ServerTimeSettings&) noexcept;
     void HandleUpdate(const UpdateEvent&) noexcept;
     void OnDisconnected(const DisconnectedEvent&) noexcept;
+    void OnSleep(const NotifySleep&) noexcept;
+    void SleepStatus(const String& aText) noexcept;
 
     void ToggleGameClock(bool aEnable);
     float TimeInterpolate(const TimeModel& aFrom, TimeModel& aTo) const;
@@ -31,6 +34,7 @@ private:
     entt::scoped_connection m_timeUpdateConnection;
     entt::scoped_connection m_updateConnection;
     entt::scoped_connection m_disconnectedConnection;
+    entt::scoped_connection m_sleepConnection;
 
     DateTime m_onlineTime;
     DateTime m_offlineTime;

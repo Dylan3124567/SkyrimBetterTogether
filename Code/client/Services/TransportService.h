@@ -25,6 +25,7 @@ struct TransportService : Client
     ~TransportService() noexcept = default;
 
     TP_NOCOPYMOVE(TransportService);
+    bool Connect(const std::string& acEndpoint) noexcept;
 
     bool Send(const ClientMessage& acMessage, TiltedPhoques::EPacketFlags aPacketFlags = TiltedPhoques::kReliable) const noexcept;
 

@@ -10,7 +10,6 @@
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/rotating_file_sink.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <Systems/RenderSystemD3D11.h>
 
@@ -59,18 +58,14 @@ std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> CreateClientLogSink(const 
 
 TiltedOnlineApp::TiltedOnlineApp()
 {
-    // Set console code page to UTF-8 so console known how to interpret string data
-    SetConsoleOutputCP(CP_UTF8);
-
     auto logPath = TiltedPhoques::GetPath() / "logs";
 
     std::error_code ec;
     create_directory(logPath, ec);
 
     auto rotatingLogger = CreateClientLogSink(logPath);
-    // rotatingLogger->set_level(spdlog::level::debug);
-    auto console = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-    auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{console, rotatingLogger});
+    // Console selection can block WriteConsole on a game thread indefinitely.
+    auto logger = std::make_shared<spdlog::logger>("", rotatingLogger);
     logger->set_pattern("%^[%Y-%m-%d %H:%M:%S.%e] [%l] [tid %t] %$ %v");
     spdlog::flush_every(std::chrono::seconds(1));
     set_default_logger(logger);

@@ -1,4 +1,5 @@
 <div class="container">
+  <h2>{{ 'COMPONENT.ROOT.CONNECT' | transloco }}</h2>
   <div class="instructions">
     <p [innerHtml]="'COMPONENT.CONNECT.INFO.SERVER_ADDRESS' | transloco"></p>
     <p class="warning">
@@ -6,7 +7,10 @@
     </p>
   </div>
 
+  <label for="join-address">{{ 'COMPONENT.CONNECT.ADDRESS' | transloco }}</label>
   <input
+    id="join-address"
+    [disabled]="connecting"
     #input
     type="text"
     [placeholder]="'COMPONENT.CONNECT.ADDRESS' | transloco"
@@ -14,7 +18,10 @@
     [(ngModel)]="address"
     spellcheck="false"
   />
+  <label for="join-password">{{ 'COMPONENT.CONNECT.PASSWORD' | transloco }}</label>
   <input
+    id="join-password"
+    [disabled]="connecting"
     [type]="hidePassword ? 'password' : 'text'"
     [placeholder]="'COMPONENT.CONNECT.PASSWORD' | transloco"
     spellcheck="false"
@@ -42,10 +49,9 @@
       (click)="connect()"
       data-style-ornament="simple"
     >
-      {{ 'COMPONENT.CONNECT.CONNECT' | transloco }}
+      {{ (connecting ? 'COMPONENT.CONNECT.JOINING' : 'COMPONENT.CONNECT.CONNECT') | transloco }}
     </button>
     <button
-      [disabled]="connecting"
       (click)="cancel()"
       data-style-ornament="simple"
     >
@@ -53,7 +59,7 @@
     </button>
   </app-action-buttons>
   <hr />
-  <button (click)="openServerList()" data-style-ornament="simple">
+  <button [disabled]="connecting" (click)="openServerList()" data-style-ornament="simple">
     {{ 'COMPONENT.CONNECT.PUBLIC_SERVERS' | transloco }}
   </button>
 </div>

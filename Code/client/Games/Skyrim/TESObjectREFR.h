@@ -15,6 +15,7 @@
 
 struct AnimationVariables;
 struct TESWorldSpace;
+struct TESObjectCELL;
 struct TESBoundObject;
 struct TESActorBase;
 struct TESContainer;
@@ -64,6 +65,11 @@ struct TESObjectREFR : TESForm
 
     static void GetItemFromExtraData(Inventory::Entry& arEntry, ExtraDataList* apExtraDataList) noexcept;
     static ExtraDataList* GetExtraDataFromItem(const Inventory::Entry& arEntry) noexcept;
+    /**
+     * @brief Creates a physical reference of an item, without taking it from anyone.
+     * @param apCell The cell of an interior, exteriors find their cell through the position.
+     */
+    static TESObjectREFR* PlaceItem(TESBoundObject* apItem, int32_t aCount, TESObjectCELL* apCell, TESWorldSpace* apWorldSpace, const NiPoint3& acPosition) noexcept;
 
     virtual void sub_3B();
     virtual void sub_3C();
@@ -188,6 +194,10 @@ struct TESObjectREFR : TESForm
     void Disable() const noexcept;
     void Enable() const noexcept;
     void MoveTo(TESObjectCELL* apCell, const NiPoint3& acPosition) const noexcept;
+    /**
+     * @brief Moves a reference inside its cell and resets its physics there. Unlike MoveTo(), this leaves its 3D in place.
+     */
+    void WarpTo(const NiPoint3& acPosition) noexcept;
     void PayGold(int32_t aAmount) noexcept;
     void PayGoldToContainer(TESObjectREFR* pContainer, int32_t aAmount) noexcept;
     bool SendAnimationEvent(BSFixedString* apEventName) noexcept;

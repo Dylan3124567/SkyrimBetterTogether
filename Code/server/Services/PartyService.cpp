@@ -1,5 +1,7 @@
 #include <Services/PartyService.h>
 #include <Components.h>
+#include <Messages/RequestHelgenReady.h>
+#include <Messages/NotifyHelgenState.h>
 #include <GameServer.h>
 
 #include <Events/PlayerJoinEvent.h>
@@ -31,6 +33,7 @@ PartyService::PartyService(World& aWorld, entt::dispatcher& aDispatcher) noexcep
     , m_partyChangeLeaderConnection(aDispatcher.sink<PacketEvent<PartyChangeLeaderRequest>>().connect<&PartyService::OnPartyChangeLeader>(this))
     , m_partyKickConnection(aDispatcher.sink<PacketEvent<PartyKickRequest>>().connect<&PartyService::OnPartyKick>(this))
 {
+    m_helgenConnection = aDispatcher.sink<PacketEvent<RequestHelgenReady>>().connect<&PartyService::OnHelgenReady>(this);
 }
 
 const PartyService::Party* PartyService::GetById(uint32_t aId) const noexcept
@@ -64,7 +67,8 @@ PartyService::Party* PartyService::GetPlayerParty(Player* const apPlayer) noexce
     auto& inviterPartyComponent = apPlayer->GetParty();
     if (inviterPartyComponent.JoinedPartyId)
     {
-        return &m_parties[*inviterPartyComponent.JoinedPartyId];
+        auto itor = m_parties.find(*inviterPartyComponent.JoinedPartyId);
+        return itor != m_parties.end() ? &itor.value() : nullptr;
     }
 
     return nullptr;
@@ -79,14 +83,13 @@ void PartyService::OnUpdate(const UpdateEvent& acEvent) noexcept
     // Only expire once every 10 seconds
     m_nextInvitationExpire = cCurrentTick + 10000;
 
-    auto view = m_world.view<PartyComponent>();
-    for (auto entity : view)
+    for (auto* pPlayer : m_world.GetPlayerManager())
     {
-        auto& partyComponent = view.get<PartyComponent>(entity);
+        auto& partyComponent = pPlayer->GetParty();
         auto itor = std::begin(partyComponent.Invitations);
         while (itor != std::end(partyComponent.Invitations))
         {
-            if (itor->second < cCurrentTick)
+            if (itor->second <= cCurrentTick)
             {
                 itor = partyComponent.Invitations.erase(itor);
             }
@@ -149,7 +152,7 @@ void PartyService::OnPartyChangeLeader(const PacketEvent<PartyChangeLeaderReques
     }
 
     auto& inviterPartyComponent = player->GetParty();
-    if (inviterPartyComponent.JoinedPartyId) // Ensure not in party
+    if (inviterPartyComponent.JoinedPartyId)
     {
         Party& party = m_parties[*inviterPartyComponent.JoinedPartyId];
         if (party.LeaderPlayerId == player->GetId())
@@ -183,14 +186,13 @@ void PartyService::OnPartyKick(const PacketEvent<PartyKickRequest>& acPacket) no
     }
 
     auto& inviterPartyComponent = player->GetParty();
-    if (inviterPartyComponent.JoinedPartyId) // Ensure not in party
+    if (inviterPartyComponent.JoinedPartyId && inviterPartyComponent.JoinedPartyId == pKick->GetParty().JoinedPartyId)
     {
         Party& party = m_parties[*inviterPartyComponent.JoinedPartyId];
         if (party.LeaderPlayerId == player->GetId())
         {
             spdlog::debug("[PartyService]: Kicking player {} from party", pKick->GetId());
             RemovePlayerFromParty(pKick);
-            BroadcastPlayerList(pKick);
         }
     }
 }
@@ -222,6 +224,7 @@ void PartyService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept
                 Party& party = m_parties[*playerPartyComponent.JoinedPartyId];
 
                 party.Members.push_back(acEvent.pPlayer);
+                party.QuestRuns.clear();
                 acEvent.pPlayer->GetParty().JoinedPartyId = *playerPartyComponent.JoinedPartyId;
 
                 SendPartyJoinedEvent(party, acEvent.pPlayer);
@@ -298,7 +301,12 @@ void PartyService::OnPartyAcceptInvite(const PacketEvent<PartyAcceptInviteReques
         auto& selfPartyComponent = pSelf->GetParty();
 
         // Check if we have this invitation so people don't invite themselves
-        if (selfPartyComponent.Invitations.count(pInviter) == 0)
+        const auto invitation = selfPartyComponent.Invitations.find(pInviter);
+        if (invitation == selfPartyComponent.Invitations.end())
+            return;
+        const bool expired = invitation->second <= GameServer::Get()->GetTick();
+        selfPartyComponent.Invitations.erase(invitation);
+        if (expired)
             return;
 
         spdlog::debug("[PartyService]: Invite found, processing.");
@@ -325,6 +333,8 @@ void PartyService::OnPartyAcceptInvite(const PacketEvent<PartyAcceptInviteReques
         }
 
         party.Members.push_back(pSelf);
+        // A new member's quests weren't part of what was relayed
+        party.QuestRuns.clear();
         selfPartyComponent.JoinedPartyId = partyId;
 
         spdlog::debug("[PartyService]: Added invitee to party, sending events");
@@ -346,6 +356,10 @@ void PartyService::OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept
 
 void PartyService::RemovePlayerFromParty(Player* apPlayer) noexcept
 {
+    // Invites belong to this membership, and must not survive a leave or disconnect.
+    for (auto* pPlayer : m_world.GetPlayerManager())
+        pPlayer->GetParty().Invitations.erase(apPlayer);
+
     auto* pPartyComponent = &apPlayer->GetParty();
     spdlog::debug("[PartyService]: Removing player from party.");
 
@@ -356,7 +370,9 @@ void PartyService::RemovePlayerFromParty(Player* apPlayer) noexcept
         Party& party = m_parties[id];
         auto& members = party.Members;
 
-        members.erase(std::find(std::begin(members), std::end(members), apPlayer));
+        members.erase(std::remove(members.begin(), members.end(), apPlayer), members.end());
+        party.Helgen.Players.erase(apPlayer->GetId());
+        party.QuestRuns.clear();
 
         if (members.empty())
         {
@@ -366,11 +382,12 @@ void PartyService::RemovePlayerFromParty(Player* apPlayer) noexcept
         {
             if (party.LeaderPlayerId == apPlayer->GetId())
             {
-                party.LeaderPlayerId = members.at(0)->GetId(); // Reassign party leader
+                party.LeaderPlayerId = members.front()->GetId(); // Reassign party leader
                 spdlog::debug("[PartyService]: Leader left, reassigned party leader to {}", party.LeaderPlayerId);
             }
             spdlog::debug("[PartyService]: Updating other party players of removal.");
             BroadcastPartyInfo(id);
+            BroadcastHelgenState(id);
         }
 
         pPartyComponent->JoinedPartyId.reset();
@@ -440,4 +457,75 @@ void PartyService::SendPartyJoinedEvent(Party& aParty, Player* aPlayer) noexcept
     }
     spdlog::debug("[PartyService]: Sending party join event to player");
     aPlayer->Send(joinedMessage);
+}
+
+void PartyService::OnHelgenReady(const PacketEvent<RequestHelgenReady>& acEvent) noexcept
+{
+    const auto& request = acEvent.Packet;
+    Player* pPlayer = acEvent.pPlayer;
+    Party* pParty = GetPlayerParty(pPlayer);
+    if (!pParty)
+        return;
+    const uint32_t session = *pPlayer->GetParty().JoinedPartyId + 1;
+    if ((request.State == 0 && request.Session != 0 && request.Session != session) ||
+        (request.State != 0 && request.Session != session))
+        return;
+    Vector<uint32_t> members;
+    for (Player* pMember : pParty->Members)
+        members.push_back(pMember->GetId());
+    if (!pParty->Helgen.Report(pPlayer->GetId(), request.State, members))
+    {
+        NotifyHelgenState rejected;
+        rejected.Session = session;
+        rejected.Phase = 3;
+        pPlayer->Send(rejected);
+        return;
+    }
+    if (request.State == 1 && !request.Name.empty() && request.Name.size() <= 128 &&
+        request.Name.find_first_of("\r\n") == String::npos && request.Name.find('\0') == String::npos && request.Name != pPlayer->GetUsername())
+    {
+        pPlayer->SetUsername(request.Name);
+        NotifyPlayerJoined renamed;
+        renamed.PlayerId = pPlayer->GetId();
+        renamed.Username = pPlayer->GetUsername();
+        renamed.Level = pPlayer->GetLevel();
+        renamed.WorldSpaceId = pPlayer->GetCellComponent().WorldSpaceId;
+        renamed.CellId = pPlayer->GetCellComponent().Cell;
+        GameServer::Get()->SendToPlayers(renamed, pPlayer);
+        BroadcastPlayerList();
+        spdlog::info("Helgen character {} named '{}'", pPlayer->GetId(), pPlayer->GetUsername().c_str());
+    }
+    if (pPlayer->GetId() == pParty->LeaderPlayerId && request.State == 1 &&
+        ((request.ScenePhases & 0xFFFF) < 256 || (request.ScenePhases & 0xFFFF) == 0xFFFF) &&
+        ((request.ScenePhases >> 16) < 256 || (request.ScenePhases >> 16) == 0xFFFF))
+    {
+        pParty->Helgen.ScenePhases = request.ScenePhases;
+        pParty->Helgen.LeaderAtBlock |= request.LeaderAtBlock;
+    }
+    BroadcastHelgenState(session - 1);
+}
+
+void PartyService::BroadcastHelgenState(uint32_t aPartyId) noexcept
+{
+    auto it = m_parties.find(aPartyId);
+    if (it == m_parties.end() || it->second.Helgen.Players.empty())
+        return;
+    auto& party = it.value();
+    Vector<uint32_t> members;
+    for (Player* pMember : party.Members)
+        members.push_back(pMember->GetId());
+    party.Helgen.Update(members);
+    NotifyHelgenState notification;
+    notification.Session = aPartyId + 1;
+    notification.Phase = party.Helgen.Phase;
+    notification.ScenePhases = party.Helgen.ScenePhases;
+    notification.LeaderAtBlock = party.Helgen.LeaderAtBlock;
+    notification.Ready = party.Helgen.Count(members);
+    notification.Total = static_cast<uint32_t>(members.size());
+    const auto leader = party.Helgen.Players.find(party.LeaderPlayerId);
+    notification.LeaderFinished = leader != party.Helgen.Players.end() && leader->second >= 2;
+    for (Player* pMember : party.Members)
+        if (party.Helgen.Players.contains(pMember->GetId()))
+            pMember->Send(notification);
+    spdlog::info("Helgen session {}: phase {}, ready {}/{}", notification.Session, notification.Phase, notification.Ready, notification.Total);
 }

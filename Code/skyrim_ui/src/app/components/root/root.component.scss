@@ -148,8 +148,8 @@
   --cooldown-duration: 10s;
   background: linear-gradient(
     to left, 
-    mod($-color-background, 0.3) 50%, 
-    mod($-color-background, 1) 50%
+    mod($-color-background, 0.3) 50%,
+    var(--cooldown-lit, #{mod($-color-background, 1)}) 50%
   );
   background-clip: text;
   -webkit-background-clip: text;
@@ -160,5 +160,85 @@
 
   &.cooldown-active {
     background-position: 100%;
+  }
+}
+.helgen-status {
+  position: fixed;
+  top: 10vh;
+  left: 20%;
+  right: 20%;
+  z-index: 100;
+  padding: 0.7rem 1rem;
+  color: white;
+  background: rgba(0, 0, 0, 0.85);
+  text-align: center;
+  pointer-events: none;
+}
+
+// Bounds are UiRules::kMenuShortcutAt1080 in 1080-line pixels scaled by the screen height, never by the font-size
+// setting: the native client masks and hit-tests this box (UiRules::MenuShortcutRect, checked by
+// Tools/check_menu_bounds.py). Opaque edge to edge, so the game's cursor under it
+// is hidden; nothing may paint outside it. Shown and hidden instantly, by class only.
+app-window.multiplayer-shortcut {
+  --sbt-u: calc(100vh / 1080);
+  position: fixed;
+  left: calc(var(--sbt-u) * 16);
+  top: calc(var(--sbt-u) * 96);
+  width: calc(var(--sbt-u) * 160);
+  height: calc(var(--sbt-u) * 180);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  border-width: calc(var(--sbt-u) * 16);
+  background: #000;
+  color: #e8e2d0;
+  // English fits with room for one wrapped label; a longer translation is cut rather than painted past the box.
+  overflow: hidden;
+  visibility: hidden;
+
+  &.shown {
+    visibility: visible;
+  }
+}
+
+.multiplayer-shortcut-title {
+  // The left padding balances the letter-spacing trailing the last letter.
+  padding: calc(var(--sbt-u) * 2) 0 calc(var(--sbt-u) * 7) 0.25em;
+  font-size: calc(var(--sbt-u) * 12);
+  letter-spacing: 0.25em;
+  text-align: center;
+  text-transform: uppercase;
+  opacity: 0.6;
+  background: linear-gradient(to right, transparent, currentColor, transparent)
+    bottom / 100% 1px no-repeat;
+}
+
+.multiplayer-shortcut-entries {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+
+  > button {
+    justify-content: center;
+    padding: calc(var(--sbt-u) * 3.5) 0;
+    font-size: calc(var(--sbt-u) * 15);
+    letter-spacing: 0.06em;
+    text-align: center;
+    color: inherit;
+    opacity: 0.8;
+    --cooldown-lit: #e8e2d0;
+
+    &::before,
+    &::after {
+      display: none;
+    }
+
+    &:hover:not([disabled]),
+    &[data-style-active='true'] {
+      color: #fff;
+      opacity: 1;
+      --cooldown-lit: #fff;
+    }
   }
 }

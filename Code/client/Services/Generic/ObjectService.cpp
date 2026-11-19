@@ -1,4 +1,6 @@
 #include <Services/ObjectService.h>
+#include <Services/HelgenService.h>
+#include <Games/ActorExtension.h>
 
 #include <World.h>
 #include <Events/DisconnectedEvent.h>
@@ -202,7 +204,18 @@ void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessa
         if (objectData.IsSenderFirst)
             continue;
 
-        if (objectData.CurrentLockData != LockData{})
+        // Both sides of a load door share the lock stored on one of them, and GetLock() follows the link. The owners' schedule
+        // locks and unlocks it on every client, reported under the door in their cell, so what the server keeps for the side
+        // outside never changes. Applying it would undo this morning's unlock until the next one.
+        const bool cIsLoadDoor = pObject->extraData.Contains(ExtraDataType::Teleport);
+        if (cIsLoadDoor)
+        {
+            const Lock* pLock = pObject->GetLock();
+            if (pLock && objectData.CurrentLockData != LockData{} && pLock->IsLocked() != objectData.CurrentLockData.IsLocked)
+                spdlog::info("Ignored server lock state {} for load door {:X}", objectData.CurrentLockData.IsLocked, pObject->formID);
+        }
+
+        if (!cIsLoadDoor && objectData.CurrentLockData != LockData{})
         {
             Lock* pLock = pObject->GetLock();
 
@@ -250,15 +263,25 @@ entt::entity ObjectService::CreateObjectEntity(const uint32_t acFormId, const ui
 
 void ObjectService::OnActivate(const ActivateEvent& acEvent) noexcept
 {
-    if (acEvent.ActivateFlag)
-    {
-        acEvent.pObject->Activate(acEvent.pActivator, acEvent.Unk1, acEvent.pObjectToGet, acEvent.Count, acEvent.DefaultProcessing);
-    }
-
     if (!m_transport.IsConnected())
         return;
 
-    if (Lock* pLock = acEvent.pObject->GetLock())
+    auto* pObject = Cast<TESObjectREFR>(TESForm::GetById(acEvent.ObjectId));
+    if (!pObject || !pObject->baseForm)
+        return;
+
+    // A temporary form ID means nothing on other clients, or worse, something else entirely
+    if (pObject->IsTemporary())
+        return;
+
+    // The activation hook may run on a worker; objects can unload before this queued event runs.
+    // Only the actor's owner sends activations, including nested Papyrus activations.
+    auto view = m_world.view<LocalComponent, FormIdComponent>();
+    const auto pEntity = std::find_if(view.begin(), view.end(), [view, id = acEvent.ActivatorId](entt::entity entity) { return view.get<FormIdComponent>(entity).Id == id; });
+    if (pEntity == view.end())
+        return;
+
+    if (Lock* pLock = pObject->GetLock())
     {
         if (pLock->flags & 0xFF)
             return;
@@ -266,31 +289,22 @@ void ObjectService::OnActivate(const ActivateEvent& acEvent) noexcept
 
     ActivateRequest request;
 
-    if (!m_world.GetModSystem().GetServerModId(acEvent.pObject->formID, request.Id))
+    if (!m_world.GetModSystem().GetServerModId(pObject->formID, request.Id))
     {
-        spdlog::error("Server form id not found for object form id {:X}", acEvent.pObject->formID);
+        spdlog::error("Server form id not found for object form id {:X}", pObject->formID);
         return;
     }
 
-    TESObjectCELL* pCell = acEvent.pObject->GetParentCellEx();
+    TESObjectCELL* pCell = pObject->GetParentCellEx();
     if (!pCell)
     {
-        spdlog::error("Activated object has no parent cell: {:X}", acEvent.pObject->formID);
+        spdlog::error("Activated object has no parent cell: {:X}", pObject->formID);
         return;
     }
 
     if (!m_world.GetModSystem().GetServerModId(pCell->formID, request.CellId))
     {
         spdlog::error("Server cell id not found for cell form id {:X}", pCell->formID);
-        return;
-    }
-
-    auto view = m_world.view<FormIdComponent>();
-    const auto pEntity = std::find_if(std::begin(view), std::end(view), [id = acEvent.pActivator->formID, view](entt::entity entity) { return view.get<FormIdComponent>(entity).Id == id; });
-
-    if (pEntity == std::end(view))
-    {
-        // spdlog::error("Activator entity not found for form id {:X}", acEvent.pActivator->formID);
         return;
     }
 
@@ -315,11 +329,17 @@ void ObjectService::OnActivateNotify(const NotifyActivate& acMessage) noexcept
 
     const uint32_t cObjectId = World::Get().GetModSystem().GetGameId(acMessage.Id);
     TESObjectREFR* pObject = Cast<TESObjectREFR>(TESForm::GetById(cObjectId));
-    if (!pObject)
+    if (!pObject || !pObject->baseForm)
     {
         spdlog::error("Failed to retrieve object to activate.");
         return;
     }
+
+    // This would start the remote copy on the furniture from wherever it stands. Its AI doesn't run, so it never gets there,
+    // and the half started furniture state then shows up as an NPC using something that isn't there, or stays around for
+    // when this client takes over the actor. The owner's actions and movement already show the actor using the furniture.
+    if (pObject->baseForm->formType == FormType::Furniture && !pActor->GetExtension()->IsPlayer())
+        return;
 
     if (pObject->baseForm->formType == FormType::Door)
     {
@@ -353,6 +373,8 @@ void ObjectService::OnLockChange(const LockChangeEvent& acEvent) noexcept
     }
 
     const auto* const pObject = Cast<TESObjectREFR>(TESForm::GetById(acEvent.FormId));
+    if (!pObject)
+        return;
 
     TESObjectCELL* pCell = pObject->GetParentCellEx();
     if (!pCell)
@@ -414,6 +436,8 @@ void ObjectService::OnLockChangeNotify(const NotifyLockChange& acMessage) noexce
 
 void ObjectService::OnScriptAnimationEvent(const ScriptAnimationEvent& acEvent) noexcept
 {
+    if (m_world.ctx().at<HelgenService>().DeferActors())
+        return;
     ScriptAnimationRequest request{};
     request.FormID = acEvent.FormID;
     request.Animation = acEvent.Animation;
@@ -424,6 +448,12 @@ void ObjectService::OnScriptAnimationEvent(const ScriptAnimationEvent& acEvent) 
 
 void ObjectService::OnNotifyScriptAnimation(const NotifyScriptAnimation& acMessage) noexcept
 {
+    if (m_world.ctx().at<HelgenService>().DeferActors())
+        return;
+    if (acMessage.FormID == 0xC8960 && m_world.ctx().at<HelgenService>().DeferBridgeCollapse())
+        return;
+    if (acMessage.FormID == 0x10757B && m_world.ctx().at<HelgenService>().DeferTowerEntry())
+        return;
     if (acMessage.FormID == 0)
         return;
 

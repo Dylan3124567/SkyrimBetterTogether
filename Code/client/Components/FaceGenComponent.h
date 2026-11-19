@@ -11,5 +11,6 @@ struct FaceGenComponent
     FaceGenComponent() noexcept {}
 
     bool Generated{false};
+    const void* GeneratedHead{};
     Tints FaceTints{};
 };

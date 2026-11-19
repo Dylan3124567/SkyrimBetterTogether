@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * @brief Experience added to an arbitrary skill.
+ * @brief Combat experience the player's kill shares with the party.
  */
 struct AddExperienceEvent
 {

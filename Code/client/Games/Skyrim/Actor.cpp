@@ -56,8 +56,26 @@
 
 #include <ModCompat/BehaviorVar.h>
 
+#include <Events/DroppedItemEvent.h>
+#include <Camera/PlayerCamera.h>
+#include <Services/InventoryService.h>
+#include <Systems/DropRules.h>
+#include <Systems/RespawnFlow.h>
+#include <Systems/SyncRules.h>
+
 namespace
 {
+// The engine centers the 3D of a dropped item on its drop position using the item's world bound, so a stale bound throws
+// the item anywhere, up to twice the distance from the world origin. Check where it really ended up once it has settled.
+void QueueDropCheck(const Actor* apActor, const BSPointerHandle<TESObjectREFR>& acHandle, const NiPoint3* apLocation, Inventory::Entry aItem = {})
+{
+    if (!acHandle.handle.iBits || !apActor->parentCell)
+        return;
+
+    const glm::vec3 cExpected = apLocation ? glm::vec3(*apLocation) : SyncRules::GetDropPosition(apActor->position, apActor->rotation.z);
+    World::Get().GetRunner().Trigger(DroppedItemEvent(acHandle.handle.iBits, apActor->parentCell->formID, cExpected, std::move(aItem)));
+}
+
 void QueueActorInventoryChange(Actor* apActor, InventoryChangeEvent aEvent, TESObjectREFR* apTransferReference = nullptr)
 {
     auto ownershipToken = Utils::GetLocalOwnershipToken(apActor->formID);
@@ -619,13 +637,29 @@ float Actor::GetActorPermanentValue(uint32_t aId) const noexcept
     return actorValueOwner.GetPermanentValue(aId);
 }
 
+static bool IsLocalRoomRental(const Actor* apActor, uint32_t aId)
+{
+    if (aId != ActorValueInfo::kVariable09)
+        return false;
+    const auto* npc = Cast<TESNPC>(apActor->baseForm);
+    if (npc)
+        for (const auto& faction : npc->actorData.factions)
+            if (faction.faction && faction.faction->formID == 0x5091B)
+                return true; // RentRoomScript grants bed ownership locally; its rented flag must stay local too.
+    return false;
+}
+
 void Actor::SetActorValue(uint32_t aId, float aValue) noexcept
 {
+    if (IsLocalRoomRental(this, aId))
+        return;
     actorValueOwner.SetValue(aId, aValue);
 }
 
 void Actor::ForceActorValue(ActorValueOwner::ForceMode aMode, uint32_t aId, float aValue) noexcept
 {
+    if (IsLocalRoomRental(this, aId))
+        return;
     float initialValue = aMode == ActorValueOwner::ForceMode::PERMANENT 
                          ? GetActorPermanentValue(aId)
                          : GetActorValue(aId);
@@ -680,6 +714,21 @@ int32_t Actor::GetGoldAmount() const noexcept
 
 void Actor::SetActorInventory(const Inventory& acInventory) noexcept
 {
+    // Something worn from a plugin only the owner has can't be added here, this copy is better off with its own gear
+    // than with what's left, which is often no weapon at all.
+    if (!GetExtension()->IsPlayer())
+    {
+        auto& modSystem = World::Get().GetModSystem();
+        for (const auto& entry : acInventory.Entries)
+        {
+            if (entry.Count > 0 && (entry.ExtraWorn || entry.ExtraWornLeft) && !modSystem.GetGameId(entry.BaseId))
+            {
+                spdlog::info("Keeping inventory of actor {:X}, its owner wears {:X}:{:X} which isn't installed here", formID, entry.BaseId.ModId, entry.BaseId.BaseId);
+                return;
+            }
+        }
+    }
+
     spdlog::info("Setting inventory for actor {:X}", formID);
 
     // The UnEquipAll() that used to be here is redundant,
@@ -826,15 +875,21 @@ bool Actor::IsDragon() const noexcept
     return BehaviorVar::IsDragon(pExtension->GraphDescriptorHash);
 }
 
-void Actor::Kill() noexcept
+void Actor::Kill(bool aForceDeathAction) noexcept
 {
     // Never kill players
     ActorExtension* pExtension = GetExtension();
     if (pExtension->IsPlayer())
         return;
 
+    // The body drops through a death action, which remote actors have refused. That's fine when the owner's action
+    // replays too, a copy of an actor that died before this client got there would stay on its feet instead.
+    g_forceAnimation = aForceDeathAction;
+
     // TODO: these args are kind of bogus of course
     KillImpl(nullptr, 100.f, true, true);
+
+    g_forceAnimation = false;
 
     // Papyrus kill will not go through if it is queued by a kill move
     /*
@@ -963,6 +1018,19 @@ static TDamageActor* RealDamageActor = nullptr;
 // TODO: this is flawed, since it does not account for invulnerable actors
 bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bool aKillMove)
 {
+    if (RespawnProtection::IsActive())
+    {
+        if (apThis->GetExtension()->IsLocalPlayer())
+            return false;
+
+        // Spawn protection is not for fighting with. The hit is lost, and the player is fair game from now on.
+        if (apHitter && apHitter->GetExtension()->IsLocalPlayer())
+        {
+            RespawnProtection::Break();
+            return false;
+        }
+    }
+
     if (apHitter)
         World::Get().GetRunner().Trigger(HitEvent(apHitter->formID, apThis->formID));
 
@@ -994,6 +1062,16 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
         if (pExHitter->IsLocalPlayer())
         {
             World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, -realDamage));
+
+            // The killing blow on another client's actor goes to its owner, whose copy dies and tells everyone. Dying here
+            // first, on health that doesn't regenerate, left a corpse here while the owner's copy fought on.
+            if (pExHittee->IsRemote() && wouldKill && realDamage > 0.f)
+            {
+                const float cAllowed = std::max(currentHealth - 1.f, 0.f);
+                TiltedPhoques::ThisCall(RealDamageActor, apThis, aDamage * cAllowed / realDamage, apHitter, aKillMove);
+                return false;
+            }
+
             return TiltedPhoques::ThisCall(RealDamageActor, apThis, aDamage, apHitter, aKillMove);
         }
         if (pExHitter->IsRemotePlayer())
@@ -1081,6 +1159,10 @@ void TP_MAKE_THISCALL(HookAddInventoryItem, Actor, TESBoundObject* apItem, Extra
 
 void* TP_MAKE_THISCALL(HookPickUpObject, Actor, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2)
 {
+    // Players have to ask the server for an item other clients also show. NPCs can't, so they have to leave it be.
+    if (World::Get().ctx().at<InventoryService>().IsSharedDrop(apObject))
+        return nullptr;
+
     if (!ScopedInventoryOverride::IsOverriden())
     {
         auto& modSystem = World::Get().GetModSystem();
@@ -1118,11 +1200,33 @@ void* TP_MAKE_THISCALL(HookDropObject, Actor, void* apResult, TESBoundObject* ap
     if (apExtraData)
         apThis->GetItemFromExtraData(item, apExtraData);
 
+    // What lies on the ground, as opposed to what left the inventory
+    Inventory::Entry droppedItem = item;
+    droppedItem.Count = aCount;
+    droppedItem.ExtraWorn = false;
+    droppedItem.ExtraWornLeft = false;
+
     QueueActorInventoryChange(apThis, InventoryChangeEvent(apThis->formID, std::move(item), true));
+
+    // Without a location the engine casts along the view from wherever the camera object says it is. Sometimes that is
+    // near the world origin, and the item is created out there. Fixing that afterwards means moving a live physics object.
+    NiPoint3 safeLocation{};
+    if (auto* pCamera = PlayerCamera::Get(); !apLocation && pCamera)
+    {
+        const NiPoint3 cCameraPosition = pCamera->GetPosition();
+        if (DropRules::IsDropOriginStale(cCameraPosition, apThis->position))
+        {
+            spdlog::warn("Camera is at ({}, {}, {}) for a drop by the player at ({}, {}, {}), not using it", cCameraPosition.x, cCameraPosition.y, cCameraPosition.z, apThis->position.x, apThis->position.y, apThis->position.z);
+            safeLocation = SyncRules::GetDropPosition(apThis->position, apThis->rotation.z);
+            apLocation = &safeLocation;
+        }
+    }
 
     ScopedInventoryOverride _;
 
-    return TiltedPhoques::ThisCall(RealDropObject, apThis, apResult, apObject, apExtraData, aCount, apLocation, apRotation);
+    void* pResult = TiltedPhoques::ThisCall(RealDropObject, apThis, apResult, apObject, apExtraData, aCount, apLocation, apRotation);
+    QueueDropCheck(apThis, *static_cast<BSPointerHandle<TESObjectREFR>*>(apResult), apLocation, std::move(droppedItem));
+    return pResult;
 }
 
 void Actor::DropOrPickUpObject(const Inventory::Entry& arEntry, NiPoint3* apLocation, NiPoint3* apRotation) noexcept
@@ -1148,7 +1252,48 @@ void Actor::DropObject(TESBoundObject* apObject, ExtraDataList* apExtraData, int
 {
     spdlog::debug("Dropping object, form id: {:X}, count: {}, actor: {:X}", apObject->formID, aCount, formID);
     BSPointerHandle<TESObjectREFR> result{};
-    TiltedPhoques::ThisCall(RealDropObject, this, &result, apObject, apExtraData, aCount, apLocation, apRotation);
+
+    if (this == PlayerCharacter::Get())
+    {
+        TiltedPhoques::ThisCall(RealDropObject, this, &result, apObject, apExtraData, aCount, apLocation, apRotation);
+    }
+    else
+    {
+        // RealDropObject is PlayerCharacter's override, which reads and writes past the end of any other actor
+        POINTER_SKYRIMSE(TDropObject, s_actorDropObject, 37520);
+        TiltedPhoques::ThisCall(s_actorDropObject.Get(), this, &result, apObject, apExtraData, aCount, apLocation, apRotation);
+    }
+
+    QueueDropCheck(this, result, apLocation);
+}
+
+void Actor::EvaluatePackage() noexcept
+{
+    PAPYRUS_FUNCTION(void, Actor, EvaluatePackage);
+    s_pEvaluatePackage(this);
+}
+
+void Actor::ReleaseFromFurniture(bool aEvaluateAi) noexcept
+{
+    PAPYRUS_FUNCTION(void, Actor, SetRestrained, bool);
+
+    spdlog::info("Releasing actor {:X} from furniture, state: {:X}", formID, actorState.flags1);
+
+    if (actorState.IsRestrained())
+        s_pSetRestrained(this, false);
+
+    actorState.ClearFurnitureState();
+
+    // Creature behaviors don't have the humanoid event, draugr answer to the second and spiders to the rest. Without
+    // them the pose stays while the actor moves on, like a draugr floating out of its alcove.
+    for (const char* pEvent : {"IdleForceDefaultState", "forceFurnExit", "idleBedGetUp", "idleChairGetUp"})
+    {
+        BSFixedString event(pEvent);
+        SendAnimationEvent(&event);
+    }
+
+    if (aEvaluateAi)
+        EvaluatePackage();
 }
 
 TP_THIS_FUNCTION(TUpdateDetectionState, void, ActorKnowledge, void*);
@@ -1188,6 +1333,15 @@ uint64_t TP_MAKE_THISCALL(HookProcessResponse, void, DialogueItem* apVoice, Acto
     {
         if (apTalkingActor->GetExtension()->IsRemotePlayer())
             return 0;
+
+        // The AI of a remote copy picks barks of its own. They talk over the lines the owner relays, each one cutting the
+        // other off and taking the mouth with it. Scene lines stay as every client plays its scenes itself.
+        if (apTalkingActor->GetExtension()->IsRemote() && !MenuTopicManager::IsPlayerDialogueSpeaker(apTalkingActor))
+        {
+            const BGSScene* pScene = apTalkingActor->GetCurrentScene();
+            if (!pScene || !pScene->isPlaying)
+                return 0;
+        }
     }
     return TiltedPhoques::ThisCall(RealProcessResponse, apThis, apVoice, apTalkingActor, apTalkedToActor);
 }

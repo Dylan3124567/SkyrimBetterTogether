@@ -4,9 +4,11 @@
 #include <World.h>
 
 #include <Events/PlayerJoinEvent.h>
+#include <Events/PlayerLeaveEvent.h>
 #include <Events/UpdateEvent.h>
 
 #include <Messages/ServerTimeSettings.h>
+#include <Messages/Sleep.h>
 
 #include "Game/Player.h"
 
@@ -15,6 +17,8 @@ CalendarService::CalendarService(World& aWorld, entt::dispatcher& aDispatcher)
 {
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&CalendarService::OnUpdate>(this);
     m_joinConnection = aDispatcher.sink<PlayerJoinEvent>().connect<&CalendarService::OnPlayerJoin>(this);
+    m_leaveConnection = aDispatcher.sink<PlayerLeaveEvent>().connect<&CalendarService::OnPlayerLeave>(this);
+    m_sleepConnection = aDispatcher.sink<PacketEvent<RequestSleep>>().connect<&CalendarService::OnSleep>(this);
 }
 
 void CalendarService::OnUpdate(const UpdateEvent&) noexcept
@@ -30,11 +34,16 @@ void CalendarService::OnUpdate(const UpdateEvent&) noexcept
 
     auto delta = now - m_lastTick;
     m_lastTick = now;
+    if (m_sleepDeadline && now >= m_sleepDeadline)
+        CancelSleep();
+    if (m_sleep.Step)
+        return; // Native sleep steps, acknowledged by every client, own this clock temporarily.
     m_dateTime.Update(delta);
 }
 
 void CalendarService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept
 {
+    CancelSleep();
     ServerTimeSettings timeMsg;
     // the player with the furthest date is used
     bool playerHasFurthestTime = acEvent.PlayerTime.GetTimeInDays() > m_dateTime.GetTimeInDays();
@@ -65,6 +74,7 @@ void CalendarService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept
 
 bool CalendarService::SetTime(int aHours, int aMinutes, float aScale) noexcept
 {
+    CancelSleep();
     m_dateTime.m_timeModel.TimeScale = aScale;
 
     if (aHours >= 0 && aHours <= 23 && aMinutes >= 0 && aMinutes <= 59)
@@ -84,6 +94,7 @@ bool CalendarService::SetTime(int aHours, int aMinutes, float aScale) noexcept
 
 bool CalendarService::SetDate(int aDay, int aMonth, float aYear) noexcept
 {
+    CancelSleep();
     if (aMonth >= 0 && aMonth < 12 && aYear >= 0 && aYear <= 999)
     {
         auto maxDays = m_dateTime.GetNumberOfDaysByMonthIndex(aMonth);
@@ -134,6 +145,7 @@ CalendarService::TDate CalendarService::GetDate() const noexcept
 
 bool CalendarService::SetTimeScale(float aScale) noexcept
 {
+    CancelSleep();
     if (aScale >= 0.f && aScale <= 1000.f)
     {
         m_dateTime.m_timeModel.TimeScale = aScale;
@@ -149,4 +161,90 @@ bool CalendarService::SetTimeScale(float aScale) noexcept
     }
 
     return false;
+}
+
+void CalendarService::SendSleep(uint8_t aState) noexcept
+{
+    for (const auto& [id, entry] : m_sleep.Players)
+        if (auto* player = m_world.GetPlayerManager().GetById(id))
+        {
+            NotifySleep message;
+            message.Session = entry.Session;
+            message.Step = m_sleep.Step;
+            message.Ready = static_cast<uint32_t>(m_sleep.Players.size());
+            message.Total = m_world.GetPlayerManager().Count();
+            message.State = aState;
+            message.Time = m_dateTime.m_timeModel;
+            player->Send(message);
+        }
+}
+
+void CalendarService::CancelSleep() noexcept
+{
+    if (m_sleep.Players.empty())
+        return;
+    SendSleep(NotifySleep::Cancelled);
+    m_sleep = {};
+    m_sleepDeadline = 0;
+    SendTimeResync();
+    spdlog::info("Shared sleep cancelled; clock resumed");
+}
+
+void CalendarService::OnPlayerLeave(const PlayerLeaveEvent&) noexcept
+{
+    CancelSleep();
+}
+
+void CalendarService::OnSleep(const PacketEvent<RequestSleep>& acEvent) noexcept
+{
+    const auto& request = acEvent.Packet;
+    const uint32_t id = acEvent.pPlayer->GetId();
+    if (request.State == RequestSleep::Begin)
+    {
+        if (!m_sleep.Begin(id, request.Session, request.Hours, request.Seconds))
+        {
+            NotifySleep denied;
+            denied.Session = request.Session;
+            denied.State = NotifySleep::Cancelled;
+            denied.Time = m_dateTime.m_timeModel;
+            acEvent.pPlayer->Send(denied);
+            return;
+        }
+        if (!m_sleepDeadline)
+            m_sleepDeadline = GameServer::Get()->GetTick() + 120000;
+        Vector<uint32_t> players;
+        for (auto* player : m_world.GetPlayerManager())
+            players.push_back(player->GetId());
+        if (m_sleep.Start({players.data(), players.size()}))
+        {
+            m_sleepDeadline = GameServer::Get()->GetTick() + 30000;
+            spdlog::info("Shared sleep started: {} players, {} seconds", players.size(), m_sleep.RemainingSeconds);
+            SendSleep(NotifySleep::Advance);
+        }
+        else if (m_sleep.Players.size() == players.size())
+            CancelSleep(); // Different native sleep-step settings cannot share a clock safely.
+        else
+            SendSleep(NotifySleep::Waiting);
+    }
+    else if (request.State == RequestSleep::Tick && m_sleep.Tick(id, request.Session, request.Step))
+    {
+        m_dateTime.m_timeModel.Time += m_sleep.StepSeconds / 3600.f;
+        m_dateTime.Update(0); // Includes midnight, month and year rollover.
+        m_sleepDeadline = GameServer::Get()->GetTick() + 30000;
+        const bool finished = m_sleep.RemainingSeconds == 0;
+        SendSleep(finished ? NotifySleep::Finished : NotifySleep::Advance);
+        if (finished)
+        {
+            spdlog::info("Shared sleep completed at {}", m_dateTime.m_timeModel.Time);
+            m_sleep = {};
+            m_sleepDeadline = 0;
+            SendTimeResync();
+        }
+    }
+    else if (request.State == RequestSleep::Cancel)
+    {
+        auto it = m_sleep.Players.find(id);
+        if (it != m_sleep.Players.end() && it->second.Session == request.Session)
+            CancelSleep();
+    }
 }

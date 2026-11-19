@@ -78,6 +78,7 @@ struct CharacterComponent
             Flags &= ~kIsPlayerSummon;
     }
 
+    uint32_t HelgenAliasId{};
     uint32_t ChangeFlags{0};
     String SaveBuffer{};
     FormIdComponent BaseId{};

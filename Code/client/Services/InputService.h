@@ -11,6 +11,7 @@ struct InputService
     ~InputService() noexcept;
 
     static LRESULT WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static bool OpenMenuShortcutAt(uint16_t aX, uint16_t aY);
 
     TP_NOCOPYMOVE(InputService);
 };

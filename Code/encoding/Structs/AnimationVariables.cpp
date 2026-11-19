@@ -36,7 +36,7 @@ void AnimationVariables::String_to_VectorBool(const TiltedPhoques::String& chars
 
     auto citer = chars.begin();
     auto biter = bools.begin();
-    for (uint32_t mask = 1; biter < bools.end(); mask = 1, citer++)
+    for (uint32_t mask = 1; biter < bools.end() && citer < chars.end(); mask = 1, citer++)
         for (; mask < 0x100 && biter < bools.end(); mask <<= 1)
             *biter++ = (*citer & mask) ? true : false;
 }
@@ -113,13 +113,18 @@ void AnimationVariables::ApplyDiff(TiltedPhoques::Buffer::Reader& aReader)
     size_t booleansSize = TiltedPhoques::Serialization::ReadVarInt(aReader);
     size_t integersSize = TiltedPhoques::Serialization::ReadVarInt(aReader);
     size_t floatsSize   = TiltedPhoques::Serialization::ReadVarInt(aReader);
+    auto chars = TiltedPhoques::Serialization::ReadString(aReader);
+    // Validate counts against the received bit table before allocating, without overflowing their sum.
+    const size_t capacity = chars.size() * 8;
+    if (booleansSize > capacity || integersSize > capacity - booleansSize || floatsSize > capacity - booleansSize - integersSize ||
+        (booleansSize + integersSize + floatsSize + 7) / 8 != chars.size())
+        return;
     if (Integers.size() != integersSize)
         Integers.assign(integersSize, 0);
     if (Floats.size() != floatsSize)
         Floats.assign(floatsSize, 0.f);
     
     TiltedPhoques::Vector<bool> changedVector(booleansSize + integersSize + floatsSize);
-    auto chars = TiltedPhoques::Serialization::ReadString(aReader);
     String_to_VectorBool(chars, changedVector);
 
     Booleans.assign(changedVector.begin(), changedVector.begin() + booleansSize);

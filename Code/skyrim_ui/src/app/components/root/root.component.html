@@ -1,5 +1,13 @@
 <ng-container *ngIf="inGame$ | async">
-  <ng-container *ngIf="!(menuOpen$ | async)">
+  <!-- Lives for the whole game session so showing it is one class flip, with its font and frame already loaded. -->
+  <app-window border="fancy" class="multiplayer-shortcut" [class.shown]="menuShortcut$ | async">
+    <div class="multiplayer-shortcut-title">{{ 'COMPONENT.ROOT.MULTIPLAYER' | transloco }}</div>
+    <div class="multiplayer-shortcut-entries">
+      <ng-container *ngTemplateOutlet="menuButtons"></ng-container>
+    </div>
+  </app-window>
+  <div class="helgen-status" role="status" *ngIf="helgenStatus$ | async as message">{{ message }}</div>
+  <ng-container *ngIf="!(menuOpen$ | async) && !(menuShortcut$ | async)">
     <app-debug></app-debug>
 
     <app-group></app-group>
@@ -15,15 +23,16 @@
     class="app-root-controls"
     [class.background-element]="view$ | async"
   >
-    <app-window border="strip" class="app-root-menu">
-      <button
-        *ngIf="!(connected$ | async) && !(connectionInProgress$ | async)"
-        data-style-ornament="inverted"
-        [attr.data-style-active]="(view$ | async) === RootView.CONNECT"
-        (click)="setView(RootView.CONNECT)"
-      >
-        {{ 'COMPONENT.ROOT.CONNECT' | transloco }}
-      </button>
+    <app-window border="strip" class="app-root-menu" *ngIf="!(menuShortcut$ | async)">
+      <button data-style-ornament="inverted" (click)="returnToGame()">Return to game</button>
+      <ng-container *ngTemplateOutlet="menuButtons"></ng-container>
+    </app-window>
+    <app-window class="app-root-chat">
+      <app-chat #chat></app-chat>
+    </app-window>
+  </div>
+  <ng-template #menuButtons>
+      <ng-container *ngTemplateOutlet="connectionButtons"></ng-container>
       <ng-container *ngIf="connected$ | async">
         <button
           data-style-ornament="inverted"
@@ -83,15 +92,16 @@
       >
         {{ 'COMPONENT.ROOT.CONNECTION_IN_PROGRESS' | transloco }}
       </button>
-    </app-window>
-    <app-window class="app-root-chat">
-      <app-chat #chat></app-chat>
-    </app-window>
-  </div>
+  </ng-template>
+  <ng-template #connectionButtons>
+    <button data-style-ornament="inverted" [attr.data-style-active]="(view$ | async) === RootView.HOST" (click)="setView(RootView.HOST)">{{ 'HOST.TITLE' | transloco }}</button>
+    <button *ngIf="!(connected$ | async) && !(connectionInProgress$ | async)" data-style-ornament="inverted" [attr.data-style-active]="(view$ | async) === RootView.CONNECT" (click)="setView(RootView.CONNECT)">{{ 'COMPONENT.ROOT.CONNECT' | transloco }}</button>
+  </ng-template>
   <div [@fadeInOutActive]="active$ | async" class="app-root-popups">
     <app-loading></app-loading>
 
     <ng-container [ngSwitch]="view$ | async">
+      <app-popup *ngSwitchCase="RootView.HOST"><app-host (done)="returnToGame()"></app-host></app-popup>
       <app-popup *ngSwitchCase="RootView.CONNECT">
         <app-connect (done)="closeView()"></app-connect>
       </app-popup>

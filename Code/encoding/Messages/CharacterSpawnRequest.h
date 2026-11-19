@@ -33,13 +33,14 @@ struct CharacterSpawnRequest final : ServerMessage
                InventoryContent == acRhs.InventoryContent && FactionsContent == acRhs.FactionsContent &&
                ActionsToReplay == acRhs.ActionsToReplay && FaceTints == acRhs.FaceTints && PlayerId == acRhs.PlayerId &&
                OwnershipEpoch == acRhs.OwnershipEpoch && IsDead == acRhs.IsDead && IsPlayer == acRhs.IsPlayer && IsWeaponDrawn == acRhs.IsWeaponDrawn &&
-               IsPlayerSummon == acRhs.IsPlayerSummon && LeveledNpcPickId == acRhs.LeveledNpcPickId && GetOpcode() == acRhs.GetOpcode();
+               IsPlayerSummon == acRhs.IsPlayerSummon && LeveledNpcPickId == acRhs.LeveledNpcPickId && HelgenAliasId == acRhs.HelgenAliasId && GetOpcode() == acRhs.GetOpcode();
     }
 
     uint32_t ServerId{};
     GameId FormId{};
     GameId BaseId{};
     GameId LeveledNpcPickId{};
+    uint32_t HelgenAliasId{}; // MQ101 alias identity for temporary NPCs; zero means none.
     GameId CellId{};
     Vector3_NetQuantize Position{};
     Rotator2_NetQuantize Rotation{};

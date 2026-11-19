@@ -1,5 +1,7 @@
 #pragma once
 
+extern bool g_deferredManualSaveReady;
+
 #pragma pack(push, 1)
 
 struct BGSSaveLoadManager

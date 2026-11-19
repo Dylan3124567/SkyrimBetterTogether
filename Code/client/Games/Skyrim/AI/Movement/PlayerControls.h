@@ -95,6 +95,7 @@ struct BSInputEnableManager
     static BSInputEnableManager* Get();
 
     static bool IsMovementControlsEnabled() noexcept;
+    uint32_t GetEnabledControls() noexcept;
 
     void EnableOtherEvent(int32_t aFlags, bool aEnable, bool aUnk2);
 };

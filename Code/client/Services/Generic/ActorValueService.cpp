@@ -1,9 +1,11 @@
 #include <TiltedOnlinePCH.h>
 
 #include <Services/ActorValueService.h>
+#include <Services/CharacterService.h>
 #include <World.h>
 #include <Forms/ActorValueInfo.h>
 #include <Games/References.h>
+#include <Games/Misc/SubtitleManager.h>
 #include <Components.h>
 
 #include <Events/UpdateEvent.h>
@@ -68,7 +70,9 @@ void ActorValueService::OnLocalComponentAdded(entt::registry& aRegistry, const e
 
 void ActorValueService::OnDisconnected(const DisconnectedEvent& acEvent) noexcept
 {
-    // TODO: this crashes sometimes, no clue why
+    // Batched damage uses server IDs, which can refer to different actors after reconnecting.
+    m_smallHealthChanges.clear();
+    // TODO: investigate the previously reported intermittent component-clear crash.
     m_world.clear<ActorValuesComponent>();
 }
 
@@ -188,10 +192,7 @@ void ActorValueService::OnHealthChange(const HealthChangeEvent& acEvent) noexcep
 
     if (acEvent.DeltaHealth > -1.0f && acEvent.DeltaHealth < 1.0f)
     {
-        if (m_smallHealthChanges.find(serverId) == m_smallHealthChanges.end())
-            m_smallHealthChanges[serverId] = acEvent.DeltaHealth;
-        else
-            m_smallHealthChanges[serverId] += acEvent.DeltaHealth;
+        m_smallHealthChanges[serverId] += acEvent.DeltaHealth;
         return;
     }
 
@@ -297,12 +298,14 @@ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcas
     const float newHealth = pActor->GetActorValue(ActorValueInfo::kHealth) + acMessage.DeltaHealth;
     pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, newHealth);
 
+    // Only the owner's copy dies of damage, its death state then reaches everyone. A copy dying on its own health, which
+    // doesn't regenerate, could die while the owner's fights on.
     const float health = pActor->GetActorValue(ActorValueInfo::kHealth);
     if (!pActor->IsDead() && health <= 0.f)
     {
         ActorExtension* pExtension = pActor->GetExtension();
         // Players should never be killed
-        if (!pExtension->IsPlayer())
+        if (!pExtension->IsPlayer() && pExtension->IsLocal())
             pActor->Kill();
     }
 
@@ -381,7 +384,7 @@ void ActorValueService::OnActorMaxValueChanges(const NotifyActorMaxValueChanges&
 
 void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessage) const noexcept
 {
-    auto view = m_world.view<FormIdComponent, RemoteComponent>();
+    auto view = m_world.view<RemoteComponent>();
 
     const auto it = std::find_if(std::begin(view), std::end(view), [&acMessage, view](entt::entity entity)
     {
@@ -398,8 +401,12 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
         return;
     }
 
-    auto& formIdComponent = view.get<FormIdComponent>(*it);
-    Actor* pActor = Cast<Actor>(TESForm::GetById(formIdComponent.Id));
+    // A copy that is still loading gets this state once its 3D is there. Missing it, the copy came back alive.
+    if (auto* pWaitingFor3D = m_world.try_get<WaitingFor3D>(*it))
+        pWaitingFor3D->SpawnRequest.IsDead = acMessage.IsDead;
+
+    const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(*it);
+    Actor* pActor = pFormIdComponent ? Cast<Actor>(TESForm::GetById(pFormIdComponent->Id)) : nullptr;
 
     if (!pActor)
         return;
@@ -412,6 +419,16 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
     if (pActor->IsDead() != acMessage.IsDead)
     {
         spdlog::info("Applying death state {} to remote actor {:X}, server id: {:X}", acMessage.IsDead, pActor->formID, acMessage.Id);
-        acMessage.IsDead ? pActor->Kill() : pActor->Respawn();
+        // Forced: a remote actor refuses its own death action, which left the body standing
+        if (acMessage.IsDead)
+            m_world.GetCharacterService().KillWhenReady(pActor);
+        else
+            pActor->Respawn();
     }
+
+    // A replayed voice can end before its subtitle packet arrives. Death must also
+    // clear an already-visible line even when health replication killed the actor first.
+    if (acMessage.IsDead)
+        if (auto* pSubtitles = SubtitleManager::Get())
+            pSubtitles->HideSubtitle(pActor);
 }

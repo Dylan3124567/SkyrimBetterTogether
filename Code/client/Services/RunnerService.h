@@ -1,6 +1,7 @@
 #pragma once
 
 #include <TiltedCore/TaskQueue.hpp>
+#include <entt/entt.hpp>
 
 struct UpdateEvent;
 

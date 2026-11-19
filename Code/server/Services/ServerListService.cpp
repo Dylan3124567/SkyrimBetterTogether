@@ -16,7 +16,7 @@ static constexpr char kMasterServerEndpoint[] =
     //"http://127.0.0.1:8000";
     "https://skyrim-reborn-list.skyrim-together.com";
 
-static Console::Setting bAnnounceServer{"LiveServices:bAnnounceServer", "Whether to list the server on the public server list", false};
+extern Console::Setting<bool> bAnnounceServer;
 
 ServerListService::ServerListService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
@@ -30,6 +30,11 @@ ServerListService::ServerListService(World& aWorld, entt::dispatcher& aDispatche
 
 void ServerListService::OnUpdate(const UpdateEvent& acEvent) noexcept
 {
+    if (m_announcement.valid() && m_announcement.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+        if (m_announcement.get())
+            GameServer::Get()->Kill();
+    }
     if (m_nextAnnounce < std::chrono::steady_clock::now())
     {
         Announce();
@@ -54,24 +59,22 @@ void ServerListService::OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept
 
 void ServerListService::Announce() noexcept
 {
-    std::thread([&]() {
-        auto* pServer = GameServer::Get();
-        auto pc = static_cast<uint16_t>(m_world.GetPlayerManager().Count());
-
-        if (bAnnounceServer)
-            m_flags |= kIsPublic;
-        if (pServer->IsPasswordProtected())
-            m_flags |= kHasPassword;
-
-        const auto& cInfo = pServer->GetInfo();
-
-        PostAnnouncement(cInfo.name, cInfo.desc, cInfo.icon_url, pServer->GetPort(), cInfo.tick_rate, pc,
-                         uMaxPlayerCount.value_as<uint16_t>(), cInfo.tagList, bAnnounceServer,
-                         pServer->IsPasswordProtected(), m_flags);
-    }).detach();
+    // Private sessions do not need a public-list heartbeat. Snapshot on the server thread.
+    if (!bAnnounceServer || m_announcement.valid())
+        return;
+    auto* pServer = GameServer::Get();
+    const auto info = pServer->GetInfo();
+    const auto port = pServer->GetPort();
+    const auto count = static_cast<uint16_t>(m_world.GetPlayerManager().Count());
+    const auto maxCount = uMaxPlayerCount.value_as<uint16_t>();
+    const bool password = pServer->IsPasswordProtected();
+    m_announcement = std::async(std::launch::async, [info, port, count, maxCount, password] {
+        return PostAnnouncement(info.name, info.desc, info.icon_url, port, info.tick_rate, count, maxCount,
+                                info.tagList, true, password, kIsPublic | (password ? kHasPassword : 0));
+    });
 }
 
-void ServerListService::PostAnnouncement(String acName, String acDesc, String acIconUrl, uint16_t aPort, uint16_t aTick,
+bool ServerListService::PostAnnouncement(String acName, String acDesc, String acIconUrl, uint16_t aPort, uint16_t aTick,
                                          uint16_t aPlayerCount, uint16_t aPlayerMaxCount, String acTagList,
                                          bool aPublic, bool aPassword, int32 aFlags) noexcept
 {
@@ -92,15 +95,16 @@ void ServerListService::PostAnnouncement(String acName, String acDesc, String ac
     };
 
     httplib::Client client(kMasterServerEndpoint);
-    client.enable_server_certificate_verification(false);
-    client.set_read_timeout(std::chrono::milliseconds(30000));
+    client.set_connection_timeout(std::chrono::seconds(5));
+    client.set_read_timeout(std::chrono::seconds(5));
+    client.set_write_timeout(std::chrono::seconds(5));
     const auto response = client.Post("/announce", params);
 
     // If we send a 403 it means we banned this server
     if (response)
     {
         if (response->status == 403)
-            GameServer::Get()->Kill();
+            return true;
         else if (response->status != 200)
             spdlog::error("Server list error! {}", response->body);
     }
@@ -108,4 +112,5 @@ void ServerListService::PostAnnouncement(String acName, String acDesc, String ac
     {
         spdlog::error("Server could not reach the server list! {}", to_string(response.error()));
     }
+    return false;
 }

@@ -11,10 +11,7 @@
 
 #include <Setting.h>
 
-namespace
-{
-Console::Setting bAnnounceServer{"LiveServices:bAnnounceServer", "Whether to list the server on the public server list", false};
-}
+extern Console::Setting<bool> bAnnounceServer;
 
 CommandService::CommandService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
@@ -27,12 +24,13 @@ void CommandService::OnSetTimeCommand(const PacketEvent<SetTimeCommandRequest>& 
 {
     NotifySetTimeResult response{};
 
-    const auto cPlayerId = static_cast<uint32_t>(acMessage.Packet.PlayerId);
+    if (acMessage.Packet.Hours > 23 || acMessage.Packet.Minutes > 59)
+        return;
 
     // Admin override: always allowed
     for (const auto session : GameServer::Get()->GetAdminSessions())
     {
-        if (PlayerManager::Get()->GetByConnectionId(session)->GetId() == cPlayerId)
+        if (PlayerManager::Get()->GetByConnectionId(session) == acMessage.pPlayer)
         {
             const auto cHours = static_cast<int>(acMessage.Packet.Hours);
             const auto cMinutes = static_cast<int>(acMessage.Packet.Minutes);

@@ -1,6 +1,7 @@
 #include "Events/CharacterInteriorCellChangeEvent.h"
 #include "Events/CharacterExteriorCellChangeEvent.h"
 #include "Events/PlayerLeaveCellEvent.h"
+#include <Events/UpdateEvent.h>
 
 #include <Services/PlayerService.h>
 #include <Services/CharacterService.h>
@@ -17,6 +18,7 @@
 #include <Messages/PlayerLevelRequest.h>
 #include <Messages/NotifyPlayerLevel.h>
 #include <Messages/NotifyPlayerCellChanged.h>
+#include <Messages/NotifyPlayerPositions.h>
 
 #include <Setting.h>
 namespace
@@ -26,12 +28,36 @@ Console::Setting fGoldLossFactor{"Gameplay:fGoldLossFactor", "How much of their 
 
 PlayerService::PlayerService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
+    , m_updateConnection(aDispatcher.sink<UpdateEvent>().connect<&PlayerService::OnUpdate>(this))
     , m_interiorCellEnterConnection(aDispatcher.sink<PacketEvent<EnterInteriorCellRequest>>().connect<&PlayerService::HandleInteriorCellEnter>(this))
     , m_gridCellShiftConnection(aDispatcher.sink<PacketEvent<ShiftGridCellRequest>>().connect<&PlayerService::HandleGridCellShift>(this))
     , m_exteriorCellEnterConnection(aDispatcher.sink<PacketEvent<EnterExteriorCellRequest>>().connect<&PlayerService::HandleExteriorCellEnter>(this))
     , m_playerRespawnConnection(aDispatcher.sink<PacketEvent<PlayerRespawnRequest>>().connect<&PlayerService::OnPlayerRespawnRequest>(this))
     , m_playerLevelConnection(aDispatcher.sink<PacketEvent<PlayerLevelRequest>>().connect<&PlayerService::OnPlayerLevelRequest>(this))
 {
+}
+
+void PlayerService::OnUpdate(const UpdateEvent&) noexcept
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now < m_nextPositionBroadcast)
+        return;
+    m_nextPositionBroadcast = now + std::chrono::seconds(1);
+
+    NotifyPlayerPositions notify{};
+    for (const auto* pPlayer : m_world.GetPlayerManager())
+    {
+        const auto character = pPlayer->GetCharacter();
+        const auto* pMovement = character ? m_world.try_get<MovementComponent>(*character) : nullptr;
+        if (!pMovement)
+            continue;
+
+        const auto& cell = pPlayer->GetCellComponent();
+        notify.Entries.push_back({pPlayer->GetId(), cell.WorldSpaceId, cell.Cell, pMovement->Position});
+    }
+
+    if (notify.Entries.size() > 1)
+        GameServer::Get()->SendToPlayers(notify);
 }
 
 void SendPlayerCellChanged(const Player* apPlayer) noexcept

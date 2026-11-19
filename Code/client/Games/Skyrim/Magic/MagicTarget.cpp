@@ -13,6 +13,7 @@
 #include <Games/ActorExtension.h>
 #include <Games/Overrides.h>
 #include <PlayerCharacter.h>
+#include <Systems/RespawnFlow.h>
 
 #include <Effects/ActiveEffect.h>
 #include <Forms/SpellItem.h>
@@ -164,6 +165,13 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
         ActorExtension* pCasterExtension = arData.pCaster->GetExtension();
         if (pCasterExtension->IsLocalPlayer())
         {
+            // See HookDamageActor
+            if (RespawnProtection::IsActive())
+            {
+                RespawnProtection::Break();
+                return false;
+            }
+
             bool result = TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
             if (result && arData.ShouldSync())
                 World::Get().GetRunner().Trigger(addTargetEvent);

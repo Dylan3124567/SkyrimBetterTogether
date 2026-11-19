@@ -43,6 +43,7 @@ public:
     bool GetMenuOpen(const BSFixedString& acName) const;
     void CloseAllMenus();
     void DebugLogAllMenus();
+    void NotifyPauseChange(bool aPaused);
 
     IMenu* FindMenuByName(const BSFixedString& acName);
     BSFixedString* LookupMenuNameByInstance(IMenu* apMenu);
@@ -56,7 +57,9 @@ public:
         TCreate* create;
     };
 
-    char pad_0[0x110]; // Too lazy to reverse inheritance for now.
+    char pad_0[0x60];
+    uint8_t menuModeEvents[0x58]; // BSTEventSource<MenuModeChangeEvent>.
+    char pad_B8[0x58];
 
     // All currently opened menus
     GameArray<IMenu*> menuStack;
@@ -90,3 +93,4 @@ public:
 // intellisense is too dumb but the compiler knows.
 static_assert(sizeof(UI) == 0x1C8);
 static_assert(offsetof(UI, UI::numPausesGame) == 0x160);
+static_assert(offsetof(UI, UI::menuModeEvents) == 0x60);

@@ -3,9 +3,11 @@
 #include <Events/ConnectedEvent.h>
 #include <Events/DisconnectedEvent.h>
 #include <Events/PartyLeftEvent.h>
+#include <Events/PartyJoinedEvent.h>
 #include <Events/UpdateEvent.h>
 
 #include <Services/QuestService.h>
+#include <Services/HelgenService.h>
 #include <Services/ImguiService.h>
 #include <Services/OverlayService.h>
 #include <Services/TransportService.h>
@@ -13,7 +15,9 @@
 #include <OverlayApp.hpp>
 
 #include <PlayerCharacter.h>
+#include <AI/Movement/PlayerControls.h>
 #include <Forms/TESQuest.h>
+#include <Interface/UI.h>
 #include <Games/TES.h>
 #include <Games/Overrides.h>
 
@@ -21,19 +25,13 @@
 
 #include <Messages/RequestQuestUpdate.h>
 #include <Messages/NotifyQuestUpdate.h>
-
-static TESQuest* FindQuestByNameId(const String& name)
-{
-    auto& questRegistry = ModManager::Get()->quests;
-    auto it = std::find_if(questRegistry.begin(), questRegistry.end(), [name](auto* it) { return std::strcmp(it->idName.AsAscii(), name.c_str()); });
-
-    return it != questRegistry.end() ? *it : nullptr;
-}
+#include <Structs/QuestSharing.h>
 
 using HeldStages = QuestService::HeldStages;
 
 static void ReleaseStagesForWaitingPhases(TESQuest* apQuest, HeldStages& aHeld) noexcept;
 static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcept;
+static void ReleaseStalledStages(TESQuest* apQuest, HeldStages& aHeld, double aDelta) noexcept;
 
 QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
     : m_world(aWorld)
@@ -42,6 +40,7 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&QuestService::OnUpdate>(this);
     m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&QuestService::OnDisconnected>(this);
     m_leftConnection = aDispatcher.sink<PartyLeftEvent>().connect<&QuestService::OnPartyLeft>(this);
+    m_partyJoinedConnection = aDispatcher.sink<PartyJoinedEvent>().connect<&QuestService::OnPartyJoined>(this);
     m_questUpdateConnection = aDispatcher.sink<NotifyQuestUpdate>().connect<&QuestService::OnQuestUpdate>(this);
 
     // Game events:
@@ -49,8 +48,8 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
     // changes. Outside a party they only prompt the overlay.
     // TESQuestStageItemDoneEvent fires once for each of a stage's log entries, after its fragment has run. That's too
     // late to send on, but it tells when an applied held stage is done.
-    // The scene, scene action, phase and dialogue line events are only logged, to follow scenes when debugging held
-    // stages. OnUpdate explains why they can't trigger the release of held stages.
+    // Scene events help diagnose held stages; phase completion also restores the local Helgen cuff-cutting controls.
+    // OnUpdate explains why scene events can't trigger the release of held stages.
 
     auto* pEventList = EventDispatcherManager::Get();
     pEventList->questStartStopEvent.RegisterSink(this);
@@ -64,6 +63,9 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
 
 void QuestService::OnConnected(const ConnectedEvent&) noexcept
 {
+    ++m_session;
+    m_pendingUpdates.clear();
+    m_heldStages.clear();
     // TODO: this should be followed with whatever the quest leader selected
     /*
     // deselect any active quests
@@ -76,10 +78,54 @@ void QuestService::OnConnected(const ConnectedEvent&) noexcept
     */
 }
 
-void QuestService::OnUpdate(const UpdateEvent&) noexcept
+void QuestService::OnUpdate(const UpdateEvent& acEvent) noexcept
 {
-    if (m_heldStages.empty())
+    if (m_pendingUpdates.empty() && m_heldStages.empty() && !m_world.GetPartyService().IsInParty())
         return;
+
+    // Quest fragments can change controls, cameras and cells. Let local character creation/loading finish first.
+    UI* pUI = UI::Get();
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    if (!pUI || !pPlayer || !pPlayer->parentCell || pUI->GetMenuOpen(BSFixedString("RaceSex Menu")) || pUI->GetMenuOpen(BSFixedString("Loading Menu")))
+        return;
+
+    // A player can pull the first keep chain while Hadvar's activation package is running.
+    // The chain sets 265, but the scene only checked that stage when entering phase 14.
+    // Do not wait for a second NPC activation after the player achieved the action.
+    // Phase 15 still waits for the gate's actual open state before proceeding.
+    if (m_world.GetPartyService().IsInParty())
+    {
+        auto* pScene = Cast<BGSScene>(TESForm::GetById(0x20167));
+        if (pScene && pScene->isPlaying && pScene->currentPhaseIndex == 14 && pScene->owningQuest && pScene->owningQuest->IsStageReached(265))
+            for (auto* pAction : pScene->actions)
+                if (pAction && pAction->GetIndex() == 17 && pAction->GetType() == BGSSceneAction::Type::kPackage && !pAction->IsComplete())
+                {
+                    pAction->status |= 2;
+                    spdlog::info("Completed Helgen gate-opening action after a player pulled the chain");
+                }
+    }
+
+    if (m_pendingUpdates.empty() && m_heldStages.empty())
+        return;
+
+    // Give each applied stage's scripts a frame before starting the next remote update.
+    if (!m_pendingUpdates.empty())
+    {
+        const auto update = m_pendingUpdates.front();
+        m_pendingUpdates.pop_front();
+        const uint32_t formId = m_world.GetModSystem().GetGameId(update.Id);
+        const auto& helgen = m_world.ctx().at<HelgenService>();
+        if (((formId == 0xD0593 && update.Stage >= 20) || (formId == 0x3372B && update.Stage >= 200)) && helgen.DeferTowerEntry())
+            m_pendingUpdates.push_front(update); // A later inn wait must not overtake the tower-opening stages.
+        else if (formId == 0xD0593 && update.Stage >= 120 && helgen.DeferExteriorBarrier(update.Stage))
+            m_pendingUpdates.push_front(update); // Keep subsequent barriers behind their local crossing.
+        else if ((formId == 0x3372B || formId == 0xD0593) && update.Stage >= 200 && helgen.DeferKeepEntry())
+            m_pendingUpdates.push_front(update); // Preserve branch selection before its cascading stages.
+        else if (update.Stage >= 500 && formId == 0x3372B && helgen.DeferBridgeCollapse())
+            m_pendingUpdates.push_back(update);
+        else
+            ApplyQuestUpdate(update);
+    }
 
     // Checked every frame rather than on scene events: an action's done event fires before its fragment runs, and the
     // action only counts as complete afterwards, with no event of its own
@@ -94,137 +140,90 @@ void QuestService::OnUpdate(const UpdateEvent&) noexcept
         {
             ReleaseStagesForWaitingPhases(pQuest, *pHeld);
             ReleaseUncheckedStages(pQuest, *pHeld);
+            ReleaseStalledStages(pQuest, *pHeld, acEvent.Delta);
         }
     }
 }
 
 void QuestService::OnDisconnected(const DisconnectedEvent&) noexcept
 {
+    ++m_session;
+    m_pendingUpdates.clear();
     m_heldStages.clear();
 }
 
 void QuestService::OnPartyLeft(const PartyLeftEvent&) noexcept
 {
+    ++m_session;
+    m_pendingUpdates.clear();
+    m_heldStages.clear();
+}
+
+void QuestService::OnPartyJoined(const PartyJoinedEvent&) noexcept
+{
+    // Do not send events queued before this party existed to its new members.
+    ++m_session;
+    m_pendingUpdates.clear();
     m_heldStages.clear();
 }
 
 BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, const EventDispatcher<TESQuestStartStopEvent>*)
 {
-    if (ScopedQuestOverride::IsOverriden())
-        return BSTEventResult::kOk;
-
-    if (!m_world.Get().GetPartyService().IsInParty())
+    if (!ScopedQuestOverride::IsOverriden())
     {
-        if (apEvent->started)
-            NotifyOverlayOfQuestUpdate(apEvent->formId);
-        return BSTEventResult::kOk;
+        if (TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(apEvent->formId)))
+            QueueQuestUpdate(apEvent->formId, pQuest->currentStage, apEvent->started ? RequestQuestUpdate::Started : RequestQuestUpdate::Stopped);
     }
-
-    spdlog::info("Quest start/stop event: {:X}", apEvent->formId);
-
-    if (TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(apEvent->formId)))
-    {
-        if (IsNonSyncableQuest(pQuest))
-            return BSTEventResult::kOk;
-     
-        if (pQuest->type == TESQuest::Type::None || pQuest->type == TESQuest::Type::Miscellaneous)
-        {
-            // Perhaps redundant, but necessary. We need the logging and
-            // the lambda coming up is queued and runs later
-            GameId Id;
-            auto& modSys = m_world.GetModSystem();
-            if (modSys.GetServerModId(pQuest->formID, Id))
-            {
-                spdlog::info(__FUNCTION__ ": queuing type none/misc quest gameId {:X} questStage {} questStatus {} questType {} formId {:X} name {}",
-                             Id.LogFormat(),  pQuest->currentStage, pQuest->IsStopped() ? RequestQuestUpdate::Stopped : RequestQuestUpdate::Started,
-                             static_cast<std::underlying_type_t<TESQuest::Type>>(pQuest->type), 
-                             pQuest->formID, pQuest->fullName.value.AsAscii());
-            }
-        }
-        
-        m_world.GetRunner().Queue(
-            [&, formId = pQuest->formID, stageId = pQuest->currentStage, stopped = pQuest->IsStopped(), type = pQuest->type]()
-            {
-                GameId Id;
-                auto& modSys = m_world.GetModSystem();
-                if (modSys.GetServerModId(formId, Id))
-                {
-                    RequestQuestUpdate update;
-                    update.Id = Id;
-                    update.Stage = stageId;
-                    update.Status = stopped ? RequestQuestUpdate::Stopped : RequestQuestUpdate::Started;
-                    update.ClientQuestType = static_cast<std::underlying_type_t<TESQuest::Type>>(type); 
-
-                    m_world.GetTransport().Send(update);
-                }
-            });
-    }
-
     return BSTEventResult::kOk;
 }
 
 BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const EventDispatcher<TESQuestStageEvent>*)
 {
-    if (ScopedQuestOverride::IsOverriden())
-        return BSTEventResult::kOk;
+    if (!ScopedQuestOverride::IsOverriden())
+        QueueQuestUpdate(apEvent->formId, apEvent->stageId, RequestQuestUpdate::StageUpdate);
+    return BSTEventResult::kOk;
+}
 
-    if (!m_world.Get().GetPartyService().IsInParty())
+void QuestService::QueueQuestUpdate(uint32_t aFormId, uint16_t aStage, uint8_t aStatus) noexcept
+{
+    // Script callbacks may run on workers. Resolve party, registry and mod state only on the game thread.
+    m_world.GetRunner().Queue([this, session = m_session.load(), aFormId, aStage, aStatus]
     {
-        NotifyOverlayOfQuestUpdate(apEvent->formId);
-        return BSTEventResult::kOk;
-    }
-
-    spdlog::info("Quest stage event: {:X}, stage: {}", apEvent->formId, apEvent->stageId);
-
-    // there is no reason to even fetch the quest object, since the event provides everything already....
-    if (TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(apEvent->formId)))
-    {
-        if (IsNonSyncableQuest(pQuest))
-            return BSTEventResult::kOk;
-
-        if (pQuest->type == TESQuest::Type::None || pQuest->type == TESQuest::Type::Miscellaneous)
+        if (session != m_session)
+            return;
+        if (m_world.ctx().at<HelgenService>().LocalQuest(aFormId))
+            return;
+        if (!m_world.GetPartyService().IsInParty())
         {
-            // Perhaps redundant, but necessary. We need the logging and
-            // the lambda coming up is queued and runs later
-            GameId Id;
-            auto& modSys = m_world.GetModSystem();
-            if (modSys.GetServerModId(pQuest->formID, Id))
-            {
-                spdlog::info(__FUNCTION__ ": queuing type none/misc quest gameId {:X} questStage {} questStatus {} questType {} formId {:X} name {}",
-                             Id.LogFormat(), pQuest->currentStage,
-                             RequestQuestUpdate::StageUpdate,
-                             static_cast<std::underlying_type_t<TESQuest::Type>>(pQuest->type),
-                             pQuest->formID, pQuest->fullName.value.AsAscii());
-            }
+            if (aStatus != RequestQuestUpdate::Stopped)
+                NotifyOverlayOfQuestUpdate(aFormId);
+            return;
         }
 
-        m_world.GetRunner().Queue(
-            [&, formId = apEvent->formId, stageId = apEvent->stageId, type = pQuest->type]()
-            {
-                GameId Id;
-                auto& modSys = m_world.GetModSystem();
-                if (modSys.GetServerModId(formId, Id))
-                {
-                    RequestQuestUpdate update;
-                    update.Id = Id;
-                    update.Stage = stageId;
-                    update.Status = RequestQuestUpdate::StageUpdate;
-                    update.ClientQuestType = static_cast<std::underlying_type_t<TESQuest::Type>>(type);
+        TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(aFormId));
+        if (!pQuest || IsNonSyncableQuest(pQuest) || !QuestSharing::IsShared(static_cast<uint8_t>(pQuest->type)))
+            return;
 
-                    m_world.GetTransport().Send(update);
-                }
-            });
-    }
-
-    return BSTEventResult::kOk;
+        RequestQuestUpdate update;
+        if (!m_world.GetModSystem().GetServerModId(aFormId, update.Id))
+            return;
+        update.Stage = aStage;
+        update.Status = aStatus;
+        update.ClientQuestType = static_cast<std::underlying_type_t<TESQuest::Type>>(pQuest->type);
+        spdlog::info("Sending quest update: {:X}, stage: {}, status: {}", aFormId, aStage, aStatus);
+        m_world.GetTransport().Send(update);
+    });
 }
 
 BSTEventResult QuestService::OnEvent(const TESQuestStageItemDoneEvent* apEvent, const EventDispatcher<TESQuestStageItemDoneEvent>*)
 {
     // Sent once the fragment of one of the stage's log entries has run, usually from a script thread
     m_world.GetRunner().Queue(
-        [this, questFormId = apEvent->formId, stage = apEvent->stageId]()
+        [this, session = m_session.load(), questFormId = apEvent->formId, stage = apEvent->stageId]()
         {
+            if (session != m_session)
+                return;
+
             auto it = m_heldStages.find(questFormId);
             if (it == m_heldStages.end())
                 return;
@@ -255,6 +254,28 @@ BSTEventResult QuestService::OnEvent(const TESSceneActionEvent* apEvent, const E
 
 BSTEventResult QuestService::OnEvent(const TESScenePhaseEvent* apEvent, const EventDispatcher<TESScenePhaseEvent>*)
 {
+    // Both vanilla cuff-cutting scenes end this phase by setting MQ101 stage 240.
+    // A member can receive 240 before entering the keep, then its local scene disables
+    // controls again. SetStage(240) is then a no-op, so repeat only its control unlock.
+    // Phase bindings: installed Skyrim.esm VMAD, Hadvar Fragment_0 / Ralof Fragment_10.
+    if (apEvent->type != 0 && ((apEvent->sceneFormId == 0x20167 && apEvent->phaseIndex == 7) ||
+                              (apEvent->sceneFormId == 0x4E1E2 && apEvent->phaseIndex == 10)))
+        m_world.GetRunner().Queue([this, session = m_session.load()]
+        {
+            if (session != m_session || !m_world.GetPartyService().IsInParty())
+                return;
+            auto* pQuest = Cast<TESQuest>(TESForm::GetById(0x3372B));
+            auto* pPlayer = PlayerCharacter::Get();
+            auto* pInput = BSInputEnableManager::Get();
+            if (pQuest && !pQuest->IsStopped() && pQuest->IsStageReached(240) && pPlayer && !pPlayer->actorState.IsBleedingOut() && pInput)
+            {
+                pInput->EnableOtherEvent(BSInputEnableManager::kPlayerControls, true, true);
+                if (auto* controls = PlayerControls::GetInstance())
+                    controls->SetActivateEnabled(true); // EnablePlayerControls also clears the separate autoload-door gate.
+                spdlog::info("Restored controls after local Helgen cuff-cutting scene");
+            }
+        });
+
     if (!spdlog::should_log(spdlog::level::debug))
         return BSTEventResult::kOk;
 
@@ -464,6 +485,36 @@ static void ReleaseUncheckedStages(TESQuest* apQuest, HeldStages& aHeld) noexcep
     }
 }
 
+// The Helgen scenes are paced by HelgenService and legitimately wait a long time for both players.
+static bool CanStall(const TESQuest* apQuest) noexcept
+{
+    return apQuest->formID != 0x3372B && apQuest->formID != 0xD0593;
+}
+
+static uint64_t GetSceneProgress(TESQuest* apQuest) noexcept
+{
+    uint64_t progress = 0;
+    for (BGSScene* pScene : apQuest->scenes)
+    {
+        if (pScene && pScene->isPlaying)
+            progress = progress * 1099511628211ull + ((static_cast<uint64_t>(pScene->formID) << 32) | pScene->currentPhaseIndex);
+    }
+
+    return progress;
+}
+
+// A scene can stop for good, and the held stage may be what would have stopped it. Then waiting only splits the party.
+static void ReleaseStalledStages(TESQuest* apQuest, HeldStages& aHeld, double aDelta) noexcept
+{
+    if (aHeld.Stages.empty() || !CanStall(apQuest) || !aHeld.Stall.Update(GetSceneProgress(apQuest), aDelta))
+        return;
+
+    spdlog::info("Applying held member quest stage {} for {:X}, its scene has stopped moving", aHeld.Stages.front(), apQuest->formID);
+    aHeld.PendingItems.clear();
+    ApplyHeldStages(apQuest, aHeld, 1);
+    aHeld.Stall.OnReleased();
+}
+
 HeldStages* QuestService::GetHeldStages(uint32_t aQuestFormId, TESQuest* apQuest) noexcept
 {
     auto it = m_heldStages.find(aQuestFormId);
@@ -504,6 +555,17 @@ HeldStages* QuestService::GetHeldStages(uint32_t aQuestFormId, TESQuest* apQuest
 
 void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
 {
+    if (m_world.ctx().at<HelgenService>().LocalQuest(m_world.GetModSystem().GetGameId(aUpdate.Id)))
+        return;
+    if (m_world.GetPartyService().IsInParty())
+        m_pendingUpdates.push_back(aUpdate);
+}
+
+void QuestService::ApplyQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
+{
+    if (!m_world.GetPartyService().IsInParty())
+        return;
+
     ModSystem& modSystem = World::Get().GetModSystem();
     uint32_t formId = modSystem.GetGameId(aUpdate.Id);
     TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(formId));
@@ -536,13 +598,6 @@ void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
         ApplyHeldStages(pQuest, *pHeld, pHeld->Stages.size());
     }
 
-    if (pQuest->type == TESQuest::Type::None || pQuest->type == TESQuest::Type::Miscellaneous)
-    {
-        spdlog::info(__FUNCTION__ ": receiving type none/misc quest update gameId {:X} questStage {} questStatus {} questType {} formId {:X} name {}",
-                     aUpdate.Id.LogFormat(), aUpdate.Stage, aUpdate.Status,
-                     aUpdate.ClientQuestType, formId, pQuest->fullName.value.AsAscii());
-    }
-
     // The quest events fire synchronously while the stage is set, don't send them back
     ScopedQuestOverride _;
 
@@ -551,15 +606,20 @@ void QuestService::OnQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
     {
     case NotifyQuestUpdate::Started:
     {
-        pQuest->ScriptSetStage(aUpdate.Stage);
+        // A start carries the stage the quest was at, usually 0, which a quest that never ran here counts as reached
+        // already, so it never started. Start it the way the game does, which runs its startup stage and fills its
+        // aliases from this world, then catch up on the stage.
+        bResult = !pQuest->IsStopped();
+        if (!bResult)
+            pQuest->EnsureQuestStarted(bResult, true);
+        if (bResult && !pQuest->IsStageReached(aUpdate.Stage))
+            bResult = pQuest->ScriptSetStage(aUpdate.Stage);
         pQuest->SetActive(true);
-        bResult = true;
         spdlog::info("Remote quest started: {:X}, stage: {}", formId, aUpdate.Stage);
         break;
     }
     case NotifyQuestUpdate::StageUpdate:
-        pQuest->ScriptSetStage(aUpdate.Stage);
-        bResult = true;
+        bResult = pQuest->ScriptSetStage(aUpdate.Stage);
         spdlog::info("Remote quest updated: {:X}, stage: {}", formId, aUpdate.Stage);
         break;
     case NotifyQuestUpdate::Stopped:

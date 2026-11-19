@@ -103,6 +103,13 @@ declare const skyrimtogether: SkyrimTogether;
 
 /** Global Skyrim: Together object type. */
 interface SkyrimTogether {
+  on(event: 'menuShortcut', callback: (visible: boolean) => void): void;
+  off(event: 'menuShortcut', callback?: (visible: boolean) => void): void;
+  on(event: 'helgenStatus', callback: (message: string) => void): void;
+  startHosting(port: number, password: string, internet: boolean): void;
+  stopHosting(): void;
+  on(event: 'hostStatus', callback: (state: string, message: string, address: string, lanAddress: string, port: number) => void): void;
+  off(event: 'hostStatus', callback?: (...args: any[]) => void): void;
   /** Add listener to when the UI is first initialized. */
   on(event: 'init', callback: SkyrimTogetherTypes.InitCallback): void;
 

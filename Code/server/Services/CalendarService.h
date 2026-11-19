@@ -3,10 +3,13 @@
 #include <Events/PacketEvent.h>
 #include <DateTime.h>
 #include <Structs/GameId.h>
+#include <Structs/SleepBarrier.h>
 
 struct World;
 struct UpdateEvent;
 struct PlayerJoinEvent;
+struct PlayerLeaveEvent;
+struct RequestSleep;
 
 /**
  * @brief Manages time and date of the world.
@@ -38,6 +41,10 @@ public:
 private:
     void OnUpdate(const UpdateEvent&) noexcept;
     void OnPlayerJoin(const PlayerJoinEvent&) noexcept;
+    void OnPlayerLeave(const PlayerLeaveEvent&) noexcept;
+    void OnSleep(const PacketEvent<RequestSleep>&) noexcept;
+    void SendSleep(uint8_t aState) noexcept;
+    void CancelSleep() noexcept;
     void SendTimeResync() noexcept;
 
     DateTime m_dateTime;
@@ -48,4 +55,8 @@ private:
 
     entt::scoped_connection m_updateConnection;
     entt::scoped_connection m_joinConnection;
+    entt::scoped_connection m_leaveConnection;
+    entt::scoped_connection m_sleepConnection;
+    SleepBarrier m_sleep;
+    uint64_t m_sleepDeadline{};
 };

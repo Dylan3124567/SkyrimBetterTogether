@@ -8,6 +8,7 @@ struct EnterInteriorCellRequest;
 struct EnterExteriorCellRequest;
 struct PlayerRespawnRequest;
 struct PlayerLevelRequest;
+struct UpdateEvent;
 
 /**
  * @brief Handles player specific actions that might change the information needed by other clients about that player.
@@ -20,6 +21,7 @@ struct PlayerService
     TP_NOCOPYMOVE(PlayerService);
 
 protected:
+    void OnUpdate(const UpdateEvent&) noexcept;
     void HandleGridCellShift(const PacketEvent<ShiftGridCellRequest>& acMessage) const noexcept;
     void HandleExteriorCellEnter(const PacketEvent<EnterExteriorCellRequest>& acMessage) const noexcept;
     void HandleInteriorCellEnter(const PacketEvent<EnterInteriorCellRequest>& acMessage) const noexcept;
@@ -28,7 +30,9 @@ protected:
 
 private:
     World& m_world;
+    std::chrono::steady_clock::time_point m_nextPositionBroadcast{};
 
+    entt::scoped_connection m_updateConnection;
     entt::scoped_connection m_gridCellShiftConnection;
     entt::scoped_connection m_exteriorCellEnterConnection;
     entt::scoped_connection m_interiorCellEnterConnection;

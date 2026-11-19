@@ -1,4 +1,5 @@
 #pragma once
+#include <future>
 
 struct World;
 struct UpdateEvent;
@@ -23,7 +24,7 @@ protected:
 private:
     void Announce() noexcept;
 
-    static void PostAnnouncement(String acName, String acDesc, String acIconUrl, uint16_t aPort, uint16_t aTick,
+    static bool PostAnnouncement(String acName, String acDesc, String acIconUrl, uint16_t aPort, uint16_t aTick,
                                  uint16_t aPlayerCount, uint16_t aPlayerMaxCount, String acTagList, bool aPublic,
                                  bool aPassword, int32 aFlags) noexcept;
 
@@ -34,7 +35,7 @@ private:
     entt::scoped_connection m_playerLeaveConnection;
     mutable std::chrono::steady_clock::time_point m_nextAnnounce;
 
-    int32 m_flags = 0;
+    std::future<bool> m_announcement;
 
     enum
     {

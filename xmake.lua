@@ -44,6 +44,20 @@ if has_config("unitybuild") then
 end
 
 -- direct dependencies version pinning 
+package("miniupnpc")
+    set_homepage("https://miniupnp.tuxfamily.org/")
+    set_license("BSD-3-Clause")
+    add_urls("https://miniupnp.tuxfamily.org/files/miniupnpc-$(version).tar.gz")
+    add_versions("2.3.3", "d52a0afa614ad6c088cc9ddff1ae7d29c8c595ac5fdd321170a05f41e634bd1a")
+    add_deps("cmake")
+    on_install("windows", function (package)
+        import("package.tools.cmake").install(package, {"-DUPNPC_BUILD_SHARED=OFF", "-DUPNPC_BUILD_TESTS=OFF", "-DUPNPC_BUILD_SAMPLE=OFF"})
+        package:add("links", "libminiupnpc")
+        package:add("syslinks", "ws2_32", "iphlpapi")
+        package:add("defines", "MINIUPNP_STATICLIB")
+    end)
+package_end()
+
 add_requires(
     "entt v3.10.0", 
     "tiltedcore 0.2.9", 
@@ -57,6 +71,7 @@ add_requires(
 )
 if is_plat("windows") then
     add_requires(
+        "miniupnpc 2.3.3",
         "discord 3.2.1", 
         "imgui v1.89.7"
     )

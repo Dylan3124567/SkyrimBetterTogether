@@ -20,6 +20,7 @@ void AssignCharacterRequest::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter
     Serialization::WriteBool(aWriter, IsPlayerSummon);
     CurrentActorData.Serialize(aWriter);
     LeveledNpcPickId.Serialize(aWriter);
+    Serialization::WriteVarInt(aWriter, HelgenAliasId);
 }
 
 void AssignCharacterRequest::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept
@@ -55,4 +56,5 @@ void AssignCharacterRequest::DeserializeRaw(TiltedPhoques::Buffer::Reader& aRead
 
     CurrentActorData.Deserialize(aReader);
     LeveledNpcPickId.Deserialize(aReader);
+    HelgenAliasId = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
 }

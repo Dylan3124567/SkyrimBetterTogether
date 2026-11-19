@@ -1,5 +1,10 @@
 #pragma once
 
+#include <Systems/RespawnFlow.h>
+
+#include <Events/EventDispatcher.h>
+#include <Games/Events.h>
+
 struct World;
 struct TransportService;
 
@@ -19,12 +24,17 @@ struct NotifyPlayerRespawn;
 /**
  * @brief Handles logic related to the local player.
  */
-struct PlayerService
+struct PlayerService : BSTEventSink<TESDeathEvent>
 {
     PlayerService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept;
     ~PlayerService() noexcept = default;
 
     TP_NOCOPYMOVE(PlayerService);
+
+    /**
+     * @brief Shares the player's combat experience with the party when the player kills something.
+     */
+    BSTEventResult OnEvent(const TESDeathEvent* apEvent, const EventDispatcher<TESDeathEvent>*) override;
 
 protected:
     void OnUpdate(const UpdateEvent& acEvent) noexcept;
@@ -41,10 +51,11 @@ protected:
 
 private:
     /**
-     * @brief Run the respawn timer, and if it hits 0, respawn the player.
+     * @brief Takes the player through going down, respawning and spawn protection.
+     * @see RespawnFlow
      */
     void RunRespawnUpdates() noexcept;
-    void RunPostDeathUpdates() noexcept;
+    void ApplyRespawnCommands(uint32_t aCommands) noexcept;
     /**
      * @brief Make sure difficulty doesn't get changed while connected
      */
@@ -58,17 +69,15 @@ private:
     entt::dispatcher& m_dispatcher;
     TransportService& m_transport;
 
-    std::chrono::steady_clock::time_point m_respawnDeadline;
+    RespawnFlow m_respawnFlow;
     int32_t m_serverDifficulty = 6;
     int32_t m_previousDifficulty = 6;
 
-    bool m_isDeathSystemEnabled = true;
-
-    bool m_knockdownStart = false;
-    std::chrono::steady_clock::time_point m_knockdownDeadline;
-
-    bool m_godmodeStart = false;
-    std::chrono::steady_clock::time_point m_godmodeDeadline;
+    bool m_isDeathSystemEnabled = false;
+    uint32_t m_aliveControls = 0;
+    uint32_t m_respawnControls = 0;
+    // Set while the respawned player is allowed to stand up from bleedout
+    bool m_canLeaveBleedout = false;
 
     uint32_t m_cachedMainSpellId = 0;
     uint32_t m_cachedSecondarySpellId = 0;

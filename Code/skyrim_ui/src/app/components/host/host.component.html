@@ -1,0 +1,35 @@
+<div class="container" *ngIf="status$ | async as status">
+  <h2>{{ 'HOST.TITLE' | transloco }}</h2>
+  <p class="instructions">{{ 'HOST.INTRO' | transloco }}</p>
+  <ng-container *ngIf="status.state === 'stopped' || status.state === 'error'; else hosting">
+    <label for="host-password">{{ 'HOST.PASSWORD' | transloco }}</label>
+    <input id="host-password" [(ngModel)]="password" maxlength="64" spellcheck="false" autocomplete="off" aria-describedby="host-password-help" />
+    <small id="host-password-help">{{ 'HOST.PASSWORD_HELP' | transloco }}</small>
+    <label class="check-option"><input type="checkbox" [(ngModel)]="internet" />{{ 'HOST.INTERNET' | transloco }}</label>
+    <details>
+      <summary>{{ 'HOST.ADVANCED' | transloco }}</summary>
+      <label for="host-port">{{ 'HOST.PORT' | transloco }}</label>
+      <input id="host-port" type="number" min="1" max="65535" [(ngModel)]="port" />
+    </details>
+    <p *ngIf="connected$ | async">{{ 'HOST.DISCONNECT_FIRST' | transloco }}</p>
+    <button (click)="start()" [disabled]="!valid || (connected$ | async) || (client.isConnectionInProgressChange | async)" data-style-ornament="simple">{{ 'HOST.START' | transloco }}</button>
+  </ng-container>
+  <ng-template #hosting>
+    <ng-container *ngIf="status.state === 'ready'">
+      <label *ngIf="status.address" for="host-address">{{ 'HOST.SHARE_ADDRESS' | transloco }}</label>
+      <input *ngIf="status.address" id="host-address" readonly [value]="status.address" (click)="$any($event.target).select()" />
+      <button *ngIf="status.address" (click)="copy(status.address)" data-style-ornament="simple">{{ (copied ? 'HOST.COPIED' : 'HOST.COPY') | transloco }}</button>
+      <small *ngIf="copyFailed">{{ 'HOST.COPY_FALLBACK' | transloco }}</small>
+      <label *ngIf="status.lanAddress" for="host-lan">{{ 'HOST.LAN_ADDRESS' | transloco }}</label>
+      <input *ngIf="status.lanAddress" id="host-lan" readonly [value]="status.lanAddress" (click)="$any($event.target).select()" />
+      <label for="active-password">{{ 'HOST.PASSWORD' | transloco }}</label>
+      <input id="active-password" readonly [value]="client.hostPassword" (click)="$any($event.target).select()" />
+      <button *ngIf="!(connected$ | async)" (click)="client.joinHostedGame()" [disabled]="client.isConnectionInProgressChange | async" data-style-ornament="simple">{{ 'HOST.JOIN_LOCAL' | transloco }}</button>
+    </ng-container>
+    <button (click)="client.stopHosting()" [disabled]="status.state === 'stopping'" data-style-ornament="simple">{{ 'HOST.STOP' | transloco }}</button>
+    <small>{{ 'HOST.STOP_HELP' | transloco }}</small>
+  </ng-template>
+  <p *ngIf="status.message" role="status" aria-live="polite">{{ status.message }}</p>
+  <p class="instructions">{{ 'HOST.PLAY_TIP' | transloco }}</p>
+  <button (click)="done.emit()" data-style-ornament="simple">{{ 'HOST.CLOSE' | transloco }}</button>
+</div>

@@ -2,6 +2,7 @@
 
 #include <Events/PacketEvent.h>
 #include <Structs/ActorData.h>
+#include <Structs/GameId.h>
 
 struct UpdateEvent;
 struct CharacterInteriorCellChangeEvent;
@@ -22,10 +23,12 @@ struct OwnershipTransferEvent;
 struct MountRequest;
 struct NewPackageRequest;
 struct RequestRespawn;
+struct RequestPlayerAppearance;
 struct SyncExperienceRequest;
 struct DialogueRequest;
 struct SubtitleRequest;
 struct Player;
+struct CellIdComponent;
 
 /**
  * @brief Manages player and actor state.
@@ -64,6 +67,7 @@ protected:
     void OnMountRequest(const PacketEvent<MountRequest>& acMessage) const noexcept;
     void OnNewPackageRequest(const PacketEvent<NewPackageRequest>& acMessage) const noexcept;
     void OnRequestRespawn(const PacketEvent<RequestRespawn>& acMessage) const noexcept;
+    void OnPlayerAppearance(const PacketEvent<RequestPlayerAppearance>& acMessage) const noexcept;
     void OnSyncExperienceRequest(const PacketEvent<SyncExperienceRequest>& acMessage) const noexcept;
     void OnDialogueRequest(const PacketEvent<DialogueRequest>& acMessage) const noexcept;
     void OnSubtitleRequest(const PacketEvent<SubtitleRequest>& acMessage) const noexcept;
@@ -71,7 +75,7 @@ protected:
     void CreateCharacter(const PacketEvent<AssignCharacterRequest>& acMessage) const noexcept;
     void PopulateAssignmentResponse(entt::entity aEntity, AssignCharacterResponse& aResponse) const noexcept;
     static const char* GetOwnershipTransferReasonName(OwnershipTransferReason aReason) noexcept;
-    bool CanClaimOwnership(Player* apPlayer, entt::entity aEntity, uint32_t aExpectedOwnershipEpoch, OwnershipTransferReason aReason) const noexcept;
+    bool CanClaimOwnership(Player* apPlayer, entt::entity aEntity, uint32_t aExpectedOwnershipEpoch, OwnershipTransferReason aReason, const CellIdComponent* apArrivalCell = nullptr) const noexcept;
     bool TransferOwnership(Player* apPlayer, entt::entity aEntity, OwnershipTransferReason aReason, bool aResetInvalidOwners = true) const noexcept;
     void TransferToNextOwner(entt::entity aEntity, OwnershipTransferReason aReason) const noexcept;
     ActorData BuildActorData(const entt::entity acEntity) const noexcept;
@@ -96,7 +100,11 @@ private:
     entt::scoped_connection m_mountConnection;
     entt::scoped_connection m_newPackageConnection;
     entt::scoped_connection m_requestRespawnConnection;
+    entt::scoped_connection m_playerAppearanceConnection;
     entt::scoped_connection m_syncExperienceConnection;
     entt::scoped_connection m_dialogueConnection;
     entt::scoped_connection m_subtitleConnection;
+
+    // When actors died, in game hours, for those whose entity went away with the last client around them
+    mutable TiltedPhoques::Map<GameId, int64_t> m_deadActors;
 };

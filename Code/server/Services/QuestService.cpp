@@ -7,12 +7,7 @@
 #include <Messages/RequestQuestUpdate.h>
 #include <Messages/NotifyQuestUpdate.h>
 
-#include <Setting.h>
-namespace
-{
-Console::Setting bEnableMiscQuestSync{"Gameplay:bEnableMiscQuestSync", "(Experimental) Syncs miscellaneous quests when possible", false};
-
-}
+#include <Structs/QuestSharing.h>
 
 QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
     : m_world(aWorld)
@@ -23,6 +18,8 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
 void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessage) noexcept
 {
     const auto& message = acMessage.Packet;
+    if (message.Status != RequestQuestUpdate::Started && message.Status != RequestQuestUpdate::StageUpdate && message.Status != RequestQuestUpdate::Stopped)
+        return;
 
     auto* pPlayer = acMessage.pPlayer;
 
@@ -37,57 +34,30 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
     notify.Status = message.Status;
     notify.ClientQuestType = message.ClientQuestType;
 
-    if (notify.ClientQuestType == 0 ||  notify.ClientQuestType == 6) // Types None or Miscellaneous. Hard-coded to avoid client header file.
-    {
-        if (!bEnableMiscQuestSync)
-            return;
-        spdlog::debug("{}: syncing type none/misc quest to party, gameId {:X} questStage {} questStatus {} questType {}",
-                     __FUNCTION__, notify.Id.LogFormat(), notify.Stage, notify.Status, notify.ClientQuestType);
-    }
+    // See QuestSharing.h for the rules
+    if (!QuestSharing::IsShared(message.ClientQuestType))
+        return;
 
-    if (message.Status == RequestQuestUpdate::Started || message.Status == RequestQuestUpdate::StageUpdate)
-    {
-        // in order to prevent bugs when a quest is in progress
-        // and being updated we add it as a new quest record to
-        // maintain a proper remote questlog state.
-        if (questIt == entries.end())
-        {
-            auto& newQuest = entries.emplace_back();
-            newQuest.Id = message.Id;
-            newQuest.Stage = message.Stage;
-
-            if (message.Status == RequestQuestUpdate::Started)
-            {
-                spdlog::debug("Started quest: {:X} stage: {}", message.Id.LogFormat(), message.Stage);
-
-                notify.Status = NotifyQuestUpdate::Started;
-            }
-            else
-            {
-                notify.Status = NotifyQuestUpdate::StageUpdate;
-            }
-        }
-        else
-        {
-            spdlog::debug("Updated quest: {:X}, stage: {}", message.Id.LogFormat(), message.Stage);
-
-            auto& record = *questIt;
-            record.Id = message.Id;
-            record.Stage = message.Stage;
-
-            notify.Status = NotifyQuestUpdate::StageUpdate;
-        }
-    }
-    else if (message.Status == RequestQuestUpdate::Stopped)
+    // The player's own quest log, kept up to date for their character data
+    if (message.Status == RequestQuestUpdate::Stopped)
     {
         spdlog::debug("Stopped quest: {:X}, stage: {}", message.Id.LogFormat(), message.Stage);
 
         if (questIt != entries.end())
             entries.erase(questIt);
-        else
-            spdlog::warn("Unable to delete quest object {:X}", message.Id.LogFormat());
+    }
+    else if (questIt == entries.end())
+    {
+        spdlog::debug("Started quest: {:X} stage: {}", message.Id.LogFormat(), message.Stage);
 
-        notify.Status = NotifyQuestUpdate::Stopped;
+        auto& newQuest = entries.emplace_back();
+        newQuest.Id = message.Id;
+        newQuest.Stage = message.Stage;
+    }
+    else
+    {
+        spdlog::debug("Updated quest: {:X}, stage: {}", message.Id.LogFormat(), message.Stage);
+        questIt->Stage = std::max(questIt->Stage, message.Stage);
     }
 
     const auto& partyComponent = acMessage.pPlayer->GetParty();
@@ -95,19 +65,12 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
     if (!pParty)
         return;
 
-    // Party members' scripts often reach the same stage on their own, only relay it once
-    if (message.Status == RequestQuestUpdate::StageUpdate)
+    // Party members' scripts often reach the same start, stage or stop on their own, only relay it once. The relayed
+    // status is the reported one: a start stays a start even if this player had the quest before, so it starts elsewhere.
+    if (!pParty->QuestRuns[message.Id].Relay(message.Status, message.Stage))
     {
-        if (!pParty->QuestStages[message.Id].insert(message.Stage).second)
-        {
-            spdlog::debug("Dropped duplicate quest stage from player {}, quest: {:X}, stage: {}", pPlayer->GetId(), message.Id.LogFormat(), message.Stage);
-            return;
-        }
-    }
-    else
-    {
-        // A started quest has run none of its stages yet, a stopped one may run them again when restarted
-        pParty->QuestStages.erase(message.Id);
+        spdlog::debug("Dropped duplicate quest update from player {}, quest: {:X}, stage: {}, status: {}", pPlayer->GetId(), message.Id.LogFormat(), message.Stage, message.Status);
+        return;
     }
 
     GameServer::Get()->SendToParty(notify, partyComponent, acMessage.GetSender());

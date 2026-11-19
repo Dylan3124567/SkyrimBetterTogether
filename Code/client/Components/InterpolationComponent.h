@@ -31,4 +31,15 @@ struct InterpolationComponent
     glm::vec3 PositionError{};
     bool IsExtrapolating{false};
     bool HasNewTimePoint{false};
+
+    // Latest word from the owner, and when this copy started disagreeing with it, see SyncRules::ShouldReleaseFurniture
+    bool OwnerHoldsInPlace{false};
+    double HeldMismatchStart{-1.0};
+    // See SyncRules::ShouldLeaveFurniture
+    bool MayBeInFurniture{true};
+    double OwnerOutOfFurnitureSince{-1.0};
+
+    // See NpcSyncRules::ShouldClaimActor
+    double LastSnapshot{-1.0};
+    double LastClaim{-1e9};
 };

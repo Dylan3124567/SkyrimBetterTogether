@@ -10,6 +10,7 @@ import {
 } from '@angular/core';
 import { TranslocoService } from '@ngneat/transloco';
 import { firstValueFrom, Subscription } from 'rxjs';
+import { parseServerAddress } from '../../models/server-address';
 import { View } from '../../models/view.enum';
 import { ClientService } from '../../services/client.service';
 import { ErrorService } from '../../services/error.service';
@@ -81,7 +82,7 @@ export class ConnectComponent implements OnDestroy, AfterViewInit {
 
   public ngAfterViewInit(): void {
     setTimeout(() => {
-      this.inputRef.nativeElement.focus();
+      this.inputRef?.nativeElement.focus();
     }, 100);
   }
 
@@ -91,7 +92,8 @@ export class ConnectComponent implements OnDestroy, AfterViewInit {
   }
 
   async connect(): Promise<void> {
-    const address = this.address.trim().match(/^(.+?)(?::([0-9]+))?$/);
+    if (this.connecting || this.client.isConnectionInProgressChange.value) return;
+    const address = parseServerAddress(this.address);
 
     if (!address) {
       this.sound.play(Sound.Fail);
@@ -115,18 +117,23 @@ export class ConnectComponent implements OnDestroy, AfterViewInit {
 
     this.sound.play(Sound.Ok);
     this.client.connect(
-      address[1],
-      address[2] ? Number.parseInt(address[2]) : 10578,
+      address.host,
+      address.port,
       this.password,
     );
   }
 
   public cancel(): void {
+    if (this.connecting) {
+      this.connecting = false;
+      this.client.disconnect();
+    }
     this.sound.play(Sound.Cancel);
     this.done.next();
   }
 
   public openServerList(): void {
+    if (this.connecting) return;
     this.uiRepository.openView(View.SERVER_LIST);
   }
 
@@ -143,7 +150,7 @@ export class ConnectComponent implements OnDestroy, AfterViewInit {
     if (this.errorService.getError()) {
       this.errorService.removeError();
     } else {
-      this.done.next();
+      this.cancel();
     }
 
     event.stopPropagation();

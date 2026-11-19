@@ -6,6 +6,7 @@
 
 #include "BSGraphics/BSGraphicsRenderer.h"
 #include "BSRandom/BSRandom.h"
+#include <Playtest.h>
 
 // shared resource by launcher
 extern HICON g_SharedWindowIcon;
@@ -45,6 +46,12 @@ LRESULT CALLBACK Hook_WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 
 void Hook_Renderer_Init(Renderer* self, BSGraphics::RendererInitOSData* aOSData, const BSGraphics::ApplicationWindowProperties* aFBData, BSGraphics::RendererInitReturn* aOut)
 {
+    if (Playtest::Baseline())
+    {
+        Renderer_Init(self, aOSData, aFBData, aOut);
+        g_RenderWindow = &self->Data.RenderWindowA[0];
+        return;
+    }
     // we feed this a shared icon as the resource directory of our former launcher data is already overwritten with the
     // game.
     aOSData->hIcon = g_SharedWindowIcon;
@@ -59,6 +66,7 @@ void Hook_Renderer_Init(Renderer* self, BSGraphics::RendererInitOSData* aOSData,
     g_sRs = &World::Get().ctx().at<RenderSystemD3D11>();
     // This how the game does it too
     g_RenderWindow = &self->Data.RenderWindowA[0];
+    SetWindowTextW(g_RenderWindow->hWnd, L"Skyrim Better Together");
 
     const BSGraphics::RendererData& renderer = self->Data;
 
@@ -70,35 +78,31 @@ void (*StopTimer)(int) = nullptr;
 // Insert us at the End
 void Hook_StopTimer(int type)
 {
+    if (Playtest::Baseline() && g_RenderWindow)
+        Playtest::Capture(g_RenderWindow->pSwapChain);
     if (g_sRs)
         g_sRs->OnRender();
 
     StopTimer(type);
 }
 
+void InstallRenderHooks()
+{
+    const VersionDbPtr<void> windowLoc(68781);
+    // The control-only baseline also needs background, non-exclusive input.
+    TiltedPhoques::Put(mem::pointer(windowLoc.GetPtr()) + 0x55 + 2, 3);
+    const VersionDbPtr<void> timerLoc(77246);
+    const VersionDbPtr<void> renderInit(77226);
+    TiltedPhoques::SwapCall(mem::pointer(timerLoc.GetPtr()) + 9, StopTimer, &Hook_StopTimer);
+    Renderer_Init = static_cast<decltype(Renderer_Init)>(renderInit.GetPtr());
+    TP_HOOK_IMMEDIATE(&Renderer_Init, &Hook_Renderer_Init);
+}
+
 static TiltedPhoques::Initializer s_viewportHooks(
     []()
     {
-        const VersionDbPtr<void> initWindowLoc(77226);
-        // patch dwStyle in BSGraphics::InitWindows
-        TiltedPhoques::Put(mem::pointer(initWindowLoc.GetPtr()) + 0x174 + 1, WS_OVERLAPPEDWINDOW);
-
-        const VersionDbPtr<void> windowLoc(68781);
-        // TODO: move me to input patches.
-        // don't let the game steal the media keys in windowed mode
-        TiltedPhoques::Put(
-            mem::pointer(windowLoc.GetPtr()) + 0x55 + 2,
-            /*strip DISCL_EXCLUSIVE bits and append DISCL_NONEXCLUSIVE*/ 3);
-
-        const VersionDbPtr<void> timerLoc(77246);
-        const VersionDbPtr<void> renderInit(77226);
-
-        TiltedPhoques::SwapCall(mem::pointer(timerLoc.GetPtr()) + 9, StopTimer, &Hook_StopTimer);
-
-        Renderer_Init = static_cast<decltype(Renderer_Init)>(renderInit.GetPtr());
-
-        // Once we find a proper way to locate it for different versions, go back to swapcall
-        // TiltedPhoques::SwapCall(mem::pointer(initLoc.GetPtr()) + 0xD1A, Renderer_Init, &Hook_Renderer_Init);
-        TP_HOOK_IMMEDIATE(&Renderer_Init, &Hook_Renderer_Init);
+        InstallRenderHooks();
     });
 } // namespace BSGraphics
+
+void Playtest::InstallRenderHooks() { BSGraphics::InstallRenderHooks(); }

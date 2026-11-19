@@ -13,6 +13,7 @@ struct World;
 struct TransportService;
 
 struct UpdateEvent;
+struct DisconnectedEvent;
 struct SpellCastEvent;
 struct InterruptCastEvent;
 struct AddTargetEvent;
@@ -49,6 +50,7 @@ struct MagicService
      * @brief Checks to apply queued effects on each frame.
      */
     void OnUpdate(const UpdateEvent& acEvent) noexcept;
+    void OnDisconnected(const DisconnectedEvent&) noexcept;
     /**
      * @brief Sends local spell cast to the server.
      */
@@ -102,6 +104,7 @@ struct MagicService
     bool m_revealingOtherPlayers = false;
 
     entt::scoped_connection m_updateConnection;
+    entt::scoped_connection m_disconnectConnection;
     entt::scoped_connection m_spellCastEventConnection;
     entt::scoped_connection m_notifySpellCastConnection;
     entt::scoped_connection m_interruptCastEventConnection;

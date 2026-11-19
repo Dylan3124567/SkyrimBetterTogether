@@ -111,15 +111,30 @@ struct PlayerCharacter : Actor
     // TODO: there's an in game function for this in fallout 4, maybe also for skyrim?
     void SetDifficulty(const int32_t aDifficulty, bool aForceUpdate = true, bool aExpectGameDataLoaded = true) noexcept;
 
+    /**
+     * @brief Takes the combat experience the player earned since the last kill, for the party to share.
+     */
+    static float TakeKillExperience() noexcept;
+
+    /**
+     * @brief Adds what a party member's kill shared with this player. Does nothing while the player isn't fighting.
+     * @see PartyExperience
+     */
     void AddSkillExperience(int32_t aSkill, float aExperience) noexcept;
     float GetSkillExperience(Skills::Skill aSkill) const noexcept { return (*pSkills)->skills[aSkill].xp; }
 
     NiPoint3 RespawnPlayer() noexcept;
+    // Clears Survival Mode's cold, and the health it takes away
+    void WarmUp() noexcept;
 
     void PayCrimeGoldToAllFactions() noexcept;
 
     void SetWaypoint(NiPoint3* apPosition, TESWorldSpace* apWorldSpace) noexcept;
     void RemoveWaypoint() noexcept;
+    /**
+     * @brief Picks up an item the server has given to this player, as if it was just activated.
+     */
+    void PickUpSharedDrop(TESObjectREFR* apObject, int32_t aCount, bool aUnk1, bool aUnk2) noexcept;
 
     struct Objective
     {

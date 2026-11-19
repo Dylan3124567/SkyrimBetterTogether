@@ -2,6 +2,8 @@
 #include <TiltedOnlineApp.h>
 #include <TiltedOnlinePCH.h>
 #include <ScriptExtender.h>
+#include <Playtest.h>
+#include <DInputHook.hpp>
 
 #include <Commctrl.h>
 #include <Windows.h>
@@ -76,6 +78,17 @@ void RunTiltedInit(const std::filesystem::path& acGamePath, const String& aExeVe
 
     g_appInstance = std::make_unique<TiltedOnlineApp>();
 
+    if (Playtest::Baseline())
+    {
+        // Control-only baseline: no gameplay initializers, World services or SKSE plugins.
+        TiltedPhoques::DInputHook::Install();
+        Playtest::InstallInputHooks();
+        Playtest::InstallRenderHooks();
+        TP_HOOK_COMMIT;
+        spdlog::info("Vanilla gameplay baseline: only playtest input/render hooks installed");
+        return;
+    }
+
     TiltedOnlineApp::InstallHooks2();
     TP_HOOK_COMMIT;
 
@@ -84,5 +97,8 @@ void RunTiltedInit(const std::filesystem::path& acGamePath, const String& aExeVe
 
 void RunTiltedApp()
 {
-    g_appInstance->BeginMain();
+    if (Playtest::Baseline())
+        Playtest::Initialize();
+    else
+        g_appInstance->BeginMain();
 }

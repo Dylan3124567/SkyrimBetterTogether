@@ -30,6 +30,12 @@ void Load(const fs::path& aGameDir)
     if (!fs::exists(steamPath))
         return;
 
+    // Pin the game's own Steam API before the search path can resolve a stray copy from the Steam
+    // folder; such a file shadows the game one and fails with "Unable to locate the original Valve API".
+    const auto gameApi = aGameDir / L"steam_api64.dll";
+    if (fs::exists(gameApi))
+        LoadLibraryW(gameApi.c_str());
+
     AddDllDirectory(steamPath.c_str());
 
     fs::path clientPath = steamPath / kSteamDllName;

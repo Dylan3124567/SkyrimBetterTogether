@@ -1,6 +1,7 @@
 #include <Services/PartyService.h>
 
 #include <Services/TransportService.h>
+#include <Services/WeatherService.h>
 
 #include <Events/UpdateEvent.h>
 #include <Events/DisconnectedEvent.h>
@@ -116,16 +117,16 @@ void PartyService::OnPartyInfo(const NotifyPartyInfo& acPartyInfo) noexcept
     if (m_inParty)
     {
         spdlog::debug("[PartyService]: Got party info update");
+        const bool leaderChanged = m_leaderPlayerId != acPartyInfo.LeaderPlayerId;
         m_isLeader = acPartyInfo.IsLeader;
         m_leaderPlayerId = acPartyInfo.LeaderPlayerId;
         m_partyMembers = acPartyInfo.PlayerIds;
 
-        // TODO: this can be done a bit prettier
-        if (m_isLeader)
-        {
-            TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1));
-            pWorldEncountersEnabled->f = 1.f;
-        }
+        if (leaderChanged)
+            m_world.ctx().at<WeatherService>().OnPartyLeaderChanged();
+
+        if (auto* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
+            pWorldEncountersEnabled->f = m_isLeader ? 1.f : 0.f;
 
         auto pArguments = CefListValue::Create();
 

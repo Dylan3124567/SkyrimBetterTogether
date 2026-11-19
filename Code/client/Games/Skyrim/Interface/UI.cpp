@@ -5,8 +5,23 @@
 #include "immersive_launcher/stubs/DllBlocklist.h"
 
 #include <World.h>
+#include <Services/OverlayService.h>
+#include <SaveLoad.h>
 
-static bool g_RequestUnpauseAll{false};
+void UI::NotifyPauseChange(bool aPaused)
+{
+    // UI::ProcessMessages (82082) sends this event when numPausesGame crosses zero.
+    // Layout and dispatcher checked against the installed 1.7.104 binary and CommonLibSSE.
+    struct MenuModeChangeEvent
+    {
+        BSFixedString menu;
+        uint8_t mode;
+    } event{BSFixedString("Shared Helgen"), static_cast<uint8_t>(aPaused)};
+    static_assert(offsetof(MenuModeChangeEvent, mode) == 8);
+    TP_THIS_FUNCTION(TSendModeChange, void, void, const MenuModeChangeEvent*);
+    POINTER_SKYRIMSE(TSendModeChange, s_sendModeChange, 82141);
+    TiltedPhoques::ThisCall(s_sendModeChange.Get(), menuModeEvents, &event);
+}
 
 UI* UI::Get()
 {
@@ -75,12 +90,28 @@ static void UnfreezeMenu(IMenu* apEntry)
 
 static constexpr const char* kAllowList[] = {
     "TweenMenu",     "MagicMenu",     "StatsMenu",     "InventoryMenu", "MessageBoxMenu",
-    "ContainerMenu", "FavoritesMenu", "Tutorial Menu", "Console"
+    "ContainerMenu", "FavoritesMenu", "Tutorial Menu"
+    // Console remains paused; manual Journal saves are deferred to the save-event phase below.
     //"MapMenu", // MapMenu is disabled till we find a proper fix for first person.
-    //"Journal Menu", // Journal menu, aka pause menu, is disabled until we find a fix for manual save crashing while unpaused.
 };
 
 static void* (*UI_AddToActiveQueue)(UI*, IMenu*, void*);
+
+static void (*RealInitializeLockModels)(IMenu*);
+static void InitializeLockModels(IMenu* apMenu)
+{
+    RealInitializeLockModels(apMenu);
+    // Native lock models initialize only on the main thread. Unpausing on menu
+    // insertion moves that work to the UI worker and leaves the interface blank.
+    auto* ui = UI::Get();
+    if (!stubs::g_IsSoulsREActive && World::Get().GetTransport().IsConnected() &&
+        ui && apMenu->PausesGame() && ui->GetMenuOpen("Lockpicking Menu"))
+    {
+        UnfreezeMenu(apMenu);
+        if (ui->numPausesGame && --ui->numPausesGame == 0)
+            ui->NotifyPauseChange(false);
+    }
+}
 
 static void* UI_AddToActiveQueue_Hook(UI* apSelf, IMenu* apMenu, void* apFoundItem /*In reality a reference*/)
 {
@@ -96,6 +127,8 @@ static void* UI_AddToActiveQueue_Hook(UI* apSelf, IMenu* apMenu, void* apFoundIt
 #endif
 
     // NOTE(Force): could also compare by RTTI later on...
+    if (g_deferredManualSaveReady && apSelf->FindMenuByName("Journal Menu") == apMenu)
+        UnfreezeMenu(apMenu);
     for (const char* item : kAllowList)
     {
         if (auto* pMenu = apSelf->FindMenuByName(item))
@@ -108,19 +141,23 @@ static void* UI_AddToActiveQueue_Hook(UI* apSelf, IMenu* apMenu, void* apFoundIt
     return UI_AddToActiveQueue(apSelf, apMenu, apFoundItem);
 }
 
-using TCallback = void(void*, const BSFixedString*, uint32_t, void*);
+using TCallback = void(void*, const BSFixedString*, UIMessage::UI_MESSAGE_TYPE, void*);
 static TCallback* UIMessageQueue__AddMessage_Real;
 
-// Useful for debugging UI related issues.
+// A menu's show message comes a frame or more before the menu is open, enough for the overlay to draw what goes with it.
 void UIMessageQueue__AddMessage(void* a1, const BSFixedString* a2, UIMessage::UI_MESSAGE_TYPE a3, void* a4)
 {
-    spdlog::info("Adding Message {} with prio {} from {}", a2->AsAscii(), a3, fmt::ptr(_ReturnAddress()));
+    if (a3 == UIMessage::kShow && a2)
+        World::Get().GetOverlayService().PrepareMenuShortcut(*a2);
     UIMessageQueue__AddMessage_Real(a1, a2, a3, a4);
 }
 
 static TiltedPhoques::Initializer s_s(
     []()
     {
+        POINTER_SKYRIMSE(void(IMenu*), initializeLockModels, 51960);
+        RealInitializeLockModels = initializeLockModels.Get();
+        TP_HOOK(&RealInitializeLockModels, InitializeLockModels);
         // pray that this doesnt fail!
         VersionDbPtr<uint8_t> ProcessHook(82082);
         TiltedPhoques::SwapCall(ProcessHook.Get() + 0x682, UI_AddToActiveQueue, &UI_AddToActiveQueue_Hook);
@@ -135,10 +172,12 @@ static TiltedPhoques::Initializer s_s(
         VersionDbPtr<uint8_t> FavoritesCanProcess(51538);
         TiltedPhoques::Put<uint16_t>(FavoritesCanProcess.Get() + 0x15, 0x9090);
 
+        // UIMessageQueue::AddMessage(menu, type, data), checked against 1.7.104: it appends to the queue's 64 slots
+        POINTER_SKYRIMSE(TCallback, s_addMessage, 13631);
+        UIMessageQueue__AddMessage_Real = s_addMessage.Get();
+        TP_HOOK(&UIMessageQueue__AddMessage_Real, UIMessageQueue__AddMessage);
+
         // Some experiments:
-        // POINTER_SKYRIMSE(TCallback, s_start, 13631);
-        // UIMessageQueue__AddMessage_Real = s_start.Get();
-        // TP_HOOK(&UIMessageQueue__AddMessage_Real, UIMessageQueue__AddMessage);
 
         // This kills the loading spinner
         // TiltedPhoques::Put<uint8_t>(0x1405D51C1, 0xEB);

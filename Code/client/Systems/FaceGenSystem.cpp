@@ -64,12 +64,9 @@ void FaceGenSystem::Update(World& aWorld, Actor* apActor, FaceGenComponent& aFac
     POINTER_SKYRIMSE(TCreateTints, CreateTints, 27040);
     POINTER_SKYRIMSE(TextureHolder, s_textureHolder, 411393);
 
-    if (aFaceGenComponent.Generated)
-        return;
-
     auto pTriBasedGeom = GetHeadTriBasedGeom(apActor, 1);
 
-    if (!pTriBasedGeom)
+    if (!pTriBasedGeom || (aFaceGenComponent.Generated && aFaceGenComponent.GeneratedHead == pTriBasedGeom))
         return;
 
     BSShaderProperty* pShaderProperty = niptr_cast<BSShaderProperty>(pTriBasedGeom->effect);
@@ -126,6 +123,7 @@ void FaceGenSystem::Update(World& aWorld, Actor* apActor, FaceGenComponent& aFac
         pMaterial->renderedTexture = pTexture;
 
         aFaceGenComponent.Generated = true;
+        aFaceGenComponent.GeneratedHead = pTriBasedGeom;
     }
 
     pShaderProperty->DecRef();

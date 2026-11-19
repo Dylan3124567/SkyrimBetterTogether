@@ -2,6 +2,10 @@
 
 #include <Messages/Message.h>
 #include <MetaMessage.h>
+#include <Messages/RequestHelgenReady.h>
+#include <Messages/PlayerAppearance.h>
+#include <Messages/Sleep.h>
+#include <Messages/DroppedItems.h>
 
 #include <Messages/AuthenticationRequest.h>
 #include <Messages/AssignCharacterRequest.h>
@@ -70,7 +74,7 @@ struct ClientMessageFactory
             PartyChangeLeaderRequest, PartyKickRequest, RequestActorValueChanges, RequestActorMaxValueChanges, EnterExteriorCellRequest, RequestHealthChangeBroadcast, ActivateRequest, LockChangeRequest, AssignObjectsRequest, RequestDeathStateChange, ShiftGridCellRequest,
             RequestOwnershipTransfer, RequestOwnershipClaim, RequestObjectInventoryChanges, SpellCastRequest, ProjectileLaunchRequest, InterruptCastRequest, AddTargetRequest, ScriptAnimationRequest, DrawWeaponRequest, MountRequest, NewPackageRequest, RequestRespawn, SyncExperienceRequest,
             RequestEquipmentChanges, SendChatMessageRequest, TeleportCommandRequest, PlayerRespawnRequest, DialogueRequest, SubtitleRequest, PlayerDialogueRequest, PlayerLevelRequest, TeleportRequest, RequestPlayerHealthUpdate, RequestWeatherChange, RequestCurrentWeather, RequestSetWaypoint,
-            RequestRemoveWaypoint, RemoveSpellRequest, SetTimeCommandRequest, RequestActionEvents>;
+            RequestRemoveWaypoint, RemoveSpellRequest, SetTimeCommandRequest, RequestActionEvents, RequestHelgenReady, RequestPlayerAppearance, RequestSleep, RequestItemDrop, RequestDroppedItems, RequestDroppedItemPickUp>;
 
         return s_visitor(std::forward<T>(func));
     }

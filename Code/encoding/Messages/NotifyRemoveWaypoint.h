@@ -15,6 +15,9 @@ struct NotifyRemoveWaypoint final : ServerMessage
 
     bool operator==(const NotifyRemoveWaypoint& acRhs) const noexcept
     {
-        return GetOpcode() == acRhs.GetOpcode();
+        return GetOpcode() == acRhs.GetOpcode() && PlayerId == acRhs.PlayerId;
     }
+
+    // Whose waypoint is gone
+    uint32_t PlayerId{};
 };

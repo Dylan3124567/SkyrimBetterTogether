@@ -20,6 +20,7 @@ void MapService::OnSetWaypointRequest(const PacketEvent<RequestSetWaypoint>& acM
     auto& message = acMessage.Packet;
 
     NotifySetWaypoint notify{};
+    notify.PlayerId = acMessage.pPlayer->GetId();
     notify.Position = message.Position;
     notify.WorldSpaceFormID = message.WorldSpaceFormID;
 
@@ -33,6 +34,7 @@ void MapService::OnSetWaypointRequest(const PacketEvent<RequestSetWaypoint>& acM
 void MapService::OnRemoveWaypointRequest(const PacketEvent<RequestRemoveWaypoint>& acMessage) const noexcept
 {
     NotifyRemoveWaypoint notify{};
+    notify.PlayerId = acMessage.pPlayer->GetId();
 
     const auto& partyComponent = acMessage.pPlayer->GetParty();
     if (!partyComponent.JoinedPartyId.has_value())

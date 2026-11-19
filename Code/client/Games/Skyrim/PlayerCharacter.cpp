@@ -8,11 +8,11 @@
 
 #include <Events/InventoryChangeEvent.h>
 #include <Events/BeastFormChangeEvent.h>
-#include <Events/AddExperienceEvent.h>
 #include <Events/SetWaypointEvent.h>
 #include <Events/RemoveWaypointEvent.h>
 
 #include <World.h>
+#include <Services/InventoryService.h>
 
 #include <Games/Skyrim/Forms/ActorValueInfo.h>
 #include <Games/ActorExtension.h>
@@ -21,15 +21,32 @@
 #include <Forms/TESWorldSpace.h>
 
 #include <Forms/TESObjectCELL.h>
+#include <Forms/TESQuest.h>
+#include <Forms/TESGlobal.h>
+#include <Forms/MagicItem.h>
 #include <Games/Skyrim/CellRespawnOverrides.h>
 
 #include <ModCompat/BehaviorVar.h>
 
+#include <Systems/PartyExperience.h>
+
+#include <atomic>
+
 int32_t PlayerCharacter::LastUsedCombatSkill = -1;
+
+// The skill hook and the death event aren't guaranteed to run on the same thread.
+static std::atomic<float> s_killExperience = 0.f;
+static std::atomic<double> s_lastCombatSkillUse = -1.0;
+
+static double GetSkillClock() noexcept
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 TP_THIS_FUNCTION(TPickUpObject, char, PlayerCharacter, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, bool aUnk2);
 TP_THIS_FUNCTION(TSetBeastForm, void, void, void* apUnk1, void* apUnk2, bool aEntering);
-TP_THIS_FUNCTION(TAddSkillExperience, void, PlayerCharacter, int32_t aSkill, float aExperience);
+// The last two are for perk conditions (the advance object and action), the function hands them on to the skills object
+TP_THIS_FUNCTION(TAddSkillExperience, void, PlayerCharacter, int32_t aSkill, float aExperience, void* apAdvanceObject, uint32_t aAdvanceAction);
 TP_THIS_FUNCTION(TCalculateExperience, bool, int32_t, float* aFactor, float* aBonus, float* aUnk1, float* aUnk2);
 TP_THIS_FUNCTION(TSetWaypoint, void, PlayerCharacter, NiPoint3* apPosition, TESWorldSpace* apWorldSpace);
 TP_THIS_FUNCTION(TRemoveWaypoint, void, PlayerCharacter);
@@ -71,31 +88,85 @@ void PlayerCharacter::SetDifficulty(const int32_t aDifficulty, bool aForceUpdate
     *difficultySetting = difficulty = aDifficulty;
 }
 
+float PlayerCharacter::TakeKillExperience() noexcept
+{
+    return s_killExperience.exchange(0.f);
+}
+
 void PlayerCharacter::AddSkillExperience(int32_t aSkill, float aExperience) noexcept
 {
     Skills::Skill skill = Skills::GetSkillFromActorValue(aSkill);
+    if (skill == Skills::kTotal)
+        return;
+
+    // A party member's kill is no reason for a skill to go up while this player isn't fighting.
+    if (!PartyExperience::IsFighting(GetSkillClock(), s_lastCombatSkillUse))
+    {
+        spdlog::info("Party kill shared {} experience, ignored as the player isn't fighting", aExperience);
+        return;
+    }
+
+    aExperience = PartyExperience::GetKillCredit(aExperience, (*pSkills)->skills[skill].levelThreshold);
+    if (aExperience <= 0.f)
+        return;
+
     float oldExperience = GetSkillExperience(skill);
 
     ScopedExperienceOverride _;
 
-    TiltedPhoques::ThisCall(RealAddSkillExperience, this, aSkill, aExperience);
+    TiltedPhoques::ThisCall(RealAddSkillExperience, this, aSkill, aExperience, static_cast<void*>(nullptr), 0u);
 
     float newExperience = GetSkillExperience(skill);
     float deltaExperience = newExperience - oldExperience;
 
-    spdlog::debug("Added {} experience to skill {}", deltaExperience, aSkill);
+    spdlog::info("Party kill added {} experience to skill {}, progress change: {}", aExperience, aSkill, deltaExperience);
+}
+
+void PlayerCharacter::WarmUp() noexcept
+{
+    const Mod* pSurvival = ModManager::Get()->GetByName("ccQDRSSE001-SurvivalMode.esl");
+    if (!pSurvival || !pSurvival->IsLoaded())
+        return;
+
+    // Survival_ColdNeedValue, the NeedValue of Survival_NeedColdQuest. The quest reads it back on its next tick.
+    auto* pCold = Cast<TESGlobal>(TESForm::GetById(pSurvival->GetFormId(0x81B)));
+    if (!pCold || pCold->f <= 0.f)
+        return;
+
+    spdlog::info("Respawning at cold {}, warming the player up", pCold->f);
+    pCold->f = 0.f;
+
+    // Survival_GlobalFunctions.ColdHealthPenaltyAV(), the health the cold takes away
+    SetActorValue(ActorValueInfo::kVariable04, 0.f);
+
+    // needSpells of Survival_NeedColdQuest, cold stages 0 to 5. The quest adds the right one back on its next tick.
+    for (const uint32_t cSpellId : {0x890u, 0x86Eu, 0x891u, 0x86Du, 0x870u, 0x871u})
+    {
+        if (auto* pSpell = Cast<MagicItem>(TESForm::GetById(pSurvival->GetFormId(cSpellId))))
+            RemoveSpell(pSpell);
+    }
 }
 
 NiPoint3 PlayerCharacter::RespawnPlayer() noexcept
 {
-    // Make bleedout state recoverable
+    // Make bleedout state recoverable, so the player gets up from it on their own once healed
     SetNoBleedoutRecovery(false);
+
+    // Survival Mode kills the player at maximum cold, and that same cold takes away all of their health. Respawning still
+    // that cold kills them again within seconds, over and over. Death restores warmth the way a fire does.
+    WarmUp();
 
     DispelAllSpells();
 
     // Reset health to max
     // TODO(cosideci): there's a cleaner way to do this
     ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, 1000000);
+
+    // Helgen closes one-way collision barriers behind the player. A cell's COC
+    // point can be behind them; recover in place while the intro is active.
+    auto* pIntro = Cast<TESQuest>(TESForm::GetById(0x3372B));
+    if (pIntro && !pIntro->IsStopped() && pIntro->IsStageReached(160) && !pIntro->IsStageReached(1000))
+        return position;
 
     TESObjectCELL* pCell = nullptr;
 
@@ -115,10 +186,7 @@ NiPoint3 PlayerCharacter::RespawnPlayer() noexcept
     NiPoint3 rot{};
 
     if (!pCell)
-    {
-        SetNoBleedoutRecovery(true);
         return pos;
-    }
 
     // If we find an override position for this respawn cell, we will use that instead of COC.
     if (!CellRespawnOverrides::GetRespawnPos(pCell, pos))
@@ -127,9 +195,6 @@ NiPoint3 PlayerCharacter::RespawnPlayer() noexcept
     }
 
     MoveTo(pCell, pos);
-
-    // Make bleedout state unrecoverable again for when the player goes down the next time
-    SetNoBleedoutRecovery(true);
 
     return pos;
 }
@@ -164,6 +229,10 @@ void PlayerCharacter::RemoveWaypoint() noexcept
 
 char TP_MAKE_THISCALL(HookPickUpObject, PlayerCharacter, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, bool aUnk2)
 {
+    // Two players must not both end up with an item they can each see, so the server decides who gets it.
+    if (World::Get().ctx().at<InventoryService>().DeferDropPickUp(apObject, aCount, aUnk1, aUnk2))
+        return 0;
+
     auto& modSystem = World::Get().GetModSystem();
 
     Inventory::Entry item{};
@@ -194,6 +263,11 @@ char TP_MAKE_THISCALL(HookPickUpObject, PlayerCharacter, TESObjectREFR* apObject
     return TiltedPhoques::ThisCall(RealPickUpObject, apThis, apObject, aCount, aUnk1, aUnk2);
 }
 
+void PlayerCharacter::PickUpSharedDrop(TESObjectREFR* apObject, int32_t aCount, bool aUnk1, bool aUnk2) noexcept
+{
+    HookPickUpObject(this, apObject, aCount, aUnk1, aUnk2);
+}
+
 void TP_MAKE_THISCALL(HookSetBeastForm, void, void* apUnk1, void* apUnk2, bool aEntering)
 {
     if (!aEntering)
@@ -205,7 +279,7 @@ void TP_MAKE_THISCALL(HookSetBeastForm, void, void* apUnk1, void* apUnk2, bool a
     TiltedPhoques::ThisCall(RealSetBeastForm, apThis, apUnk1, apUnk2, aEntering);
 }
 
-void TP_MAKE_THISCALL(HookAddSkillExperience, PlayerCharacter, int32_t aSkill, float aExperience)
+void TP_MAKE_THISCALL(HookAddSkillExperience, PlayerCharacter, int32_t aSkill, float aExperience, void* apAdvanceObject, uint32_t aAdvanceAction)
 {
     // TODO: armor skills? sneak?
     static const Set<int32_t> combatSkills{ActorValueInfo::kAlteration, ActorValueInfo::kConjuration, ActorValueInfo::kDestruction, ActorValueInfo::kIllusion, ActorValueInfo::kRestoration, ActorValueInfo::kOneHanded, ActorValueInfo::kTwoHanded, ActorValueInfo::kMarksman, ActorValueInfo::kBlock};
@@ -213,7 +287,7 @@ void TP_MAKE_THISCALL(HookAddSkillExperience, PlayerCharacter, int32_t aSkill, f
     Skills::Skill skill = Skills::GetSkillFromActorValue(aSkill);
     float oldExperience = apThis->GetSkillExperience(skill);
 
-    TiltedPhoques::ThisCall(RealAddSkillExperience, apThis, aSkill, aExperience);
+    TiltedPhoques::ThisCall(RealAddSkillExperience, apThis, aSkill, aExperience, apAdvanceObject, aAdvanceAction);
 
     float newExperience = apThis->GetSkillExperience(skill);
     float deltaExperience = newExperience - oldExperience;
@@ -225,7 +299,8 @@ void TP_MAKE_THISCALL(HookAddSkillExperience, PlayerCharacter, int32_t aSkill, f
         spdlog::debug("Set new last used combat skill to {}.", aSkill);
         PlayerCharacter::LastUsedCombatSkill = aSkill;
 
-        World::Get().GetRunner().Trigger(AddExperienceEvent(deltaExperience));
+        s_lastCombatSkillUse = GetSkillClock();
+        s_killExperience = PartyExperience::AddSkillUse(s_killExperience, deltaExperience);
     }
 }
 

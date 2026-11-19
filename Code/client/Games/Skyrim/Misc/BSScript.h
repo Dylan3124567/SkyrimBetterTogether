@@ -318,6 +318,13 @@ struct BSScript
         bool MarshallAndDispatch(Variable* apBaseVar, IVirtualMachine* apVm, uint32_t aStackID, Variable* apResult, StackFrame* apStackFrame) override;
     };
 
+    struct GetHelgenHostIdFunc : NativeFunction
+    {
+        GetHelgenHostIdFunc();
+        bool HasCallback() override { return true; }
+        bool MarshallAndDispatch(Variable*, IVirtualMachine*, uint32_t, Variable*, StackFrame*) override;
+    };
+
     // Bad PoC code
 #if 0
     template <class... T> struct EventArguments : IFunctionArguments

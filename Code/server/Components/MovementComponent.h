@@ -13,4 +13,7 @@ struct MovementComponent
     glm::vec3 Rotation;
     AnimationVariables Variables;
     float Direction;
+    // In the server's own ticks, Tick is the owner's
+    uint64_t LastReceived{};
+    bool IsHeldInPlace{};
 };

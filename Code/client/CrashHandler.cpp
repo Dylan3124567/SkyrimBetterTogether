@@ -35,6 +35,7 @@ LONG WINAPI VectoredExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo)
         alreadyCrashed++ == 0)
     {
         spdlog::critical (__FUNCTION__ ": crash occurred!"); 
+        ClipCursor(nullptr); // the cursor timer dies with the game thread
         
         spdlog::error(__FUNCTION__ ": exception code is {:x}, at address {}, flags {:x} ",
                       pExceptionInfo->ExceptionRecord->ExceptionCode,
@@ -60,13 +61,12 @@ LONG WINAPI VectoredExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo)
 
                 std::ostringstream oss;
                 oss << "crash_" << SerializeTimePoint(std::chrono::system_clock::now(), "UTC_%Y-%m-%d_%H-%M-%S")
+                    << "_" << GetCurrentProcessId()
                     << ".dmp";
 
                 GetModuleFileNameA(NULL, dumpPath, sizeof(dumpPath));
                 std::filesystem::path modulePath(dumpPath);
                 auto subPath = modulePath.parent_path();
-
-                CrashHandler::RemovePreviousDump(subPath);
 
                 subPath /= oss.str();
 
@@ -141,15 +141,4 @@ CrashHandler::CrashHandler()
 
 CrashHandler::~CrashHandler()
 {
-}
-
-void CrashHandler::RemovePreviousDump(std::filesystem::path path)
-{
-    for (auto& entry : std::filesystem::directory_iterator(path))
-    {
-        if (entry.path().string().find("crash") != std::string::npos)
-        {
-            DeleteFileA(entry.path().string().c_str());
-        }
-    }
 }

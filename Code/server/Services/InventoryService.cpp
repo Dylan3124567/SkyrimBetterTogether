@@ -10,12 +10,9 @@
 #include <Messages/RequestEquipmentChanges.h>
 #include <Messages/NotifyEquipmentChanges.h>
 #include <Messages/DrawWeaponRequest.h>
+#include <Messages/DroppedItems.h>
 
-#include <Setting.h>
-namespace
-{
-Console::Setting bEnableItemDrops{"Gameplay:bEnableItemDrops", "(Experimental) Syncs dropped items by players", false};
-}
+#include <Events/PlayerLeaveEvent.h>
 
 InventoryService::InventoryService(World& aWorld, entt::dispatcher& aDispatcher)
     : m_world(aWorld)
@@ -23,6 +20,10 @@ InventoryService::InventoryService(World& aWorld, entt::dispatcher& aDispatcher)
     m_inventoryChangeConnection = aDispatcher.sink<PacketEvent<RequestInventoryChanges>>().connect<&InventoryService::OnInventoryChanges>(this);
     m_equipmentChangeConnection = aDispatcher.sink<PacketEvent<RequestEquipmentChanges>>().connect<&InventoryService::OnEquipmentChanges>(this);
     m_drawWeaponConnection = aDispatcher.sink<PacketEvent<DrawWeaponRequest>>().connect<&InventoryService::OnWeaponDrawnRequest>(this);
+    m_itemDropConnection = aDispatcher.sink<PacketEvent<RequestItemDrop>>().connect<&InventoryService::OnItemDrop>(this);
+    m_droppedItemsConnection = aDispatcher.sink<PacketEvent<RequestDroppedItems>>().connect<&InventoryService::OnDroppedItemsRequest>(this);
+    m_droppedItemPickUpConnection = aDispatcher.sink<PacketEvent<RequestDroppedItemPickUp>>().connect<&InventoryService::OnDroppedItemPickUp>(this);
+    m_playerLeaveConnection = aDispatcher.sink<PlayerLeaveEvent>().connect<&InventoryService::OnPlayerLeave>(this);
 }
 
 void InventoryService::OnInventoryChanges(const PacketEvent<RequestInventoryChanges>& acMessage) noexcept
@@ -88,8 +89,6 @@ void InventoryService::OnInventoryChanges(const PacketEvent<RequestInventoryChan
     notify.ServerId = message.ServerId;
     notify.OwnershipEpoch = message.OwnershipEpoch;
     notify.Item = message.Item;
-
-    notify.Drop = bEnableItemDrops && !isRemoteNpcInteraction ? message.Drop : false;
 
     const entt::entity cOrigin = static_cast<entt::entity>(message.ServerId);
     if (!GameServer::Get()->SendToPlayersInRange(notify, cOrigin, acMessage.GetSender()))
@@ -157,5 +156,72 @@ void InventoryService::OnWeaponDrawnRequest(const PacketEvent<DrawWeaponRequest>
         auto& characterComponent = characterView.get<CharacterComponent>(*it);
         characterComponent.SetWeaponDrawn(message.IsWeaponDrawn);
         spdlog::debug("Updating weapon drawn state {:x}:{}", message.Id, message.IsWeaponDrawn);
+    }
+}
+
+void InventoryService::OnItemDrop(const PacketEvent<RequestItemDrop>& acMessage) noexcept
+{
+    auto* pDropper = acMessage.pPlayer;
+    const DroppedItem& item = m_droppedItems.Add(acMessage.Packet.Item, pDropper->GetId());
+
+    NotifyDroppedItems notify;
+    notify.Items.push_back(item);
+
+    const CellIdComponent cItemCell(item.CellId, item.WorldSpaceId, item.Coords);
+    for (Player* pPlayer : m_world.GetPlayerManager())
+    {
+        if (pPlayer != pDropper && cItemCell.IsInRange(pPlayer->GetCellComponent(), false))
+            pPlayer->Send(notify);
+    }
+
+    // Always answered, as the dropper can't pick the item back up until it knows the item's ID
+    notify.Items[0].Cookie = acMessage.Packet.Item.Cookie;
+    pDropper->Send(notify);
+}
+
+void InventoryService::OnDroppedItemsRequest(const PacketEvent<RequestDroppedItems>& acMessage) const noexcept
+{
+    auto& message = acMessage.Packet;
+
+    NotifyDroppedItems notify;
+
+    const CellIdComponent cPlayerCell(message.CellId, message.WorldSpaceId, message.Coords);
+    for (const auto& record : m_droppedItems.GetRecords())
+    {
+        const CellIdComponent cItemCell(record.Item.CellId, record.Item.WorldSpaceId, record.Item.Coords);
+        if (cItemCell.IsInRange(cPlayerCell, false))
+            notify.Items.push_back(record.Item);
+    }
+
+    if (!notify.Items.empty())
+        acMessage.pPlayer->Send(notify);
+}
+
+void InventoryService::OnDroppedItemPickUp(const PacketEvent<RequestDroppedItemPickUp>& acMessage) noexcept
+{
+    NotifyDroppedItemRemoved notify;
+    notify.Id = acMessage.Packet.Id;
+
+    if (!m_droppedItems.Take(notify.Id))
+    {
+        acMessage.pPlayer->Send(notify);
+        return;
+    }
+
+    // Everyone hears about it, a client can still have a reference in a cell it has since left
+    GameServer::Get()->SendToPlayers(notify, acMessage.pPlayer);
+
+    notify.Granted = true;
+    acMessage.pPlayer->Send(notify);
+}
+
+void InventoryService::OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept
+{
+    // The real reference stays in the dropper's game, so nobody else can be left with a copy of it
+    for (const uint32_t cId : m_droppedItems.TakeAllFrom(acEvent.pPlayer->GetId()))
+    {
+        NotifyDroppedItemRemoved notify;
+        notify.Id = cId;
+        GameServer::Get()->SendToPlayers(notify, acEvent.pPlayer);
     }
 }

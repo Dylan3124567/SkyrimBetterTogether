@@ -196,6 +196,7 @@ struct TESQuest : BGSStoryManagerTreeForm
     char pad250[24];
 
     TESObjectREFR* GetAliasedRef(uint32_t aiAliasID) noexcept;
+    void ForceRefIntoAlias(uint32_t aAliasId, TESObjectREFR* apRef) noexcept;
 
     bool IsStageDone(uint16_t stageIndex);
     void SetCompleted(bool force);

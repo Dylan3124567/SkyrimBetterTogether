@@ -22,7 +22,12 @@ const playerStore = createStore(
 );
 
 export class SkyrimtogetherMock extends EventEmitter implements SkyrimTogether {
+  startHosting(port: number, password: string, internet: boolean): void {
+    this.emit('hostStatus', 'ready', 'Preview only: no server or router mapping is created.', internet ? `203.0.113.42:${port}` : '', `192.168.1.10:${port}`, port);
+  }
+  stopHosting(): void { this.emit('hostStatus', 'stopped', 'Host stopped.', '', '', 10578); }
   private connected = false;
+  private pendingConnection: ReturnType<typeof setTimeout>;
   private active = false;
   private version = 'browser';
   private playerName = 'Local Player';
@@ -72,9 +77,9 @@ export class SkyrimtogetherMock extends EventEmitter implements SkyrimTogether {
           };
           break;
       }
-      setTimeout(() => {
-        this.emit(!!error ? 'disconnect' : 'connect');
+      this.pendingConnection = setTimeout(() => {
         this.connected = !error;
+        this.emit(!!error ? 'disconnect' : 'connect');
         if (error && typeof error !== 'boolean') {
           this.emit('triggerError', JSON.stringify(error));
         } else {
@@ -95,6 +100,7 @@ export class SkyrimtogetherMock extends EventEmitter implements SkyrimTogether {
   }
 
   disconnect(): void {
+    clearTimeout(this.pendingConnection);
     if (this.connected) {
       this.emit('disconnect');
       this.connected = false;

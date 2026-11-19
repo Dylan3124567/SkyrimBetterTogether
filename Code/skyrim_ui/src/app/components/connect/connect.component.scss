@@ -69,3 +69,17 @@ hr {
   background-color: grey;
   height: 1px;
 }
+
+.container {
+  max-width: 38rem;
+  max-height: 78vh;
+  overflow-y: auto;
+  padding: 0.6rem;
+  h2 { margin: 0 0 0.5rem; }
+  p, small { line-height: 1.45; }
+  > label, details { width: 100%; }
+  input[readonly] { user-select: text; }
+  .check-option { display: flex; align-items: center; gap: 0.6rem; }
+  .check-option input { width: $scrollbar; flex-shrink: 0; }
+  summary { cursor: pointer; margin-bottom: 0.5rem; }
+}

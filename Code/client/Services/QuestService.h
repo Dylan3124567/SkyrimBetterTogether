@@ -3,10 +3,14 @@
 #include <World.h>
 #include <Events/EventDispatcher.h>
 #include <Games/Events.h>
+#include <atomic>
+#include <deque>
+#include <Messages/NotifyQuestUpdate.h>
+#include <Systems/QuestStall.h>
 
-struct NotifyQuestUpdate;
 struct DisconnectedEvent;
 struct PartyLeftEvent;
+struct PartyJoinedEvent;
 struct UpdateEvent;
 
 struct TESQuest;
@@ -29,7 +33,8 @@ struct TESQuest;
  *
  * Scenes: setting a stage a playing scene waits on can end its phase early, skipping its lines and scripts and leaving
  * the quest stuck. So the leader, whose world the party follows, holds member stages that an upcoming phase checks and
- * queues later ones behind them. Members apply every stage right away.
+ * queues later ones behind them. Members apply every stage right away. A scene that stops moving doesn't keep them
+ * held, see QuestStall.
  */
 class QuestService final : public BSTEventSink<TESQuestStartStopEvent>,
                            BSTEventSink<TESQuestStageEvent>,
@@ -53,13 +58,15 @@ public:
         Vector<uint16_t> Stages{};
         // A stage per log entry of the applied stages whose fragment hasn't run yet
         Vector<uint16_t> PendingItems{};
+        QuestStall Stall{};
     };
 
 private:
     void OnConnected(const ConnectedEvent&) noexcept;
-    void OnUpdate(const UpdateEvent&) noexcept;
+    void OnUpdate(const UpdateEvent& acEvent) noexcept;
     void OnDisconnected(const DisconnectedEvent&) noexcept;
     void OnPartyLeft(const PartyLeftEvent&) noexcept;
+    void OnPartyJoined(const PartyJoinedEvent&) noexcept;
 
     BSTEventResult OnEvent(const TESQuestStartStopEvent*, const EventDispatcher<TESQuestStartStopEvent>*) override;
     BSTEventResult OnEvent(const TESQuestStageEvent*, const EventDispatcher<TESQuestStageEvent>*) override;
@@ -70,6 +77,8 @@ private:
     BSTEventResult OnEvent(const TESTopicInfoEvent*, const EventDispatcher<TESTopicInfoEvent>*) override;
 
     void OnQuestUpdate(const NotifyQuestUpdate&) noexcept;
+    void QueueQuestUpdate(uint32_t aFormId, uint16_t aStage, uint8_t aStatus) noexcept;
+    void ApplyQuestUpdate(const NotifyQuestUpdate&) noexcept;
     void HoldStage(TESQuest* apQuest, uint16_t aStage) noexcept;
     // The quest's held stages, while it has stages to apply or fragments to wait for. Drops the stages that can't be
     // applied anymore.
@@ -77,6 +86,8 @@ private:
     void NotifyOverlayOfQuestUpdate(uint32_t aFormId) noexcept;
 
     World& m_world;
+    std::atomic_uint64_t m_session{0};
+    std::deque<NotifyQuestUpdate> m_pendingUpdates;
     // Keyed by quest form ID
     Map<uint32_t, HeldStages> m_heldStages{};
 
@@ -84,5 +95,6 @@ private:
     entt::scoped_connection m_updateConnection;
     entt::scoped_connection m_disconnectedConnection;
     entt::scoped_connection m_leftConnection;
+    entt::scoped_connection m_partyJoinedConnection;
     entt::scoped_connection m_questUpdateConnection;
 };

@@ -9,7 +9,6 @@ class CrashHandler
     CrashHandler();
     ~CrashHandler();
 
-    static void RemovePreviousDump(std::filesystem::path path);
     static inline LPTOP_LEVEL_EXCEPTION_FILTER GetOriginalUnhandledExceptionFilter()
     {
         return m_pUnhandled;

@@ -13,6 +13,9 @@
 #include <Misc/BSFixedString.h>
 
 #include <World.h>
+#include <PlayerCharacter.h>
+#include <Systems/RespawnFlow.h>
+#include <Systems/SyncRules.h>
 
 TP_THIS_FUNCTION(TPerformAction, uint8_t, ActorMediator, TESActionData* apAction);
 static TPerformAction* RealPerformAction;
@@ -24,6 +27,9 @@ uint8_t TP_MAKE_THISCALL(HookPerformAction, ActorMediator, TESActionData* apActi
 {
     auto pActor = apAction->actor;
     const auto pExtension = pActor->GetExtension();
+
+    if (pActor == PlayerCharacter::Get() && apAction->action && SyncRules::IsDeliberateAction(apAction->action->formID))
+        RespawnProtection::Break();
 
     if (!pExtension->IsRemote() || g_forceAnimation)
     {
@@ -43,7 +49,9 @@ uint8_t TP_MAKE_THISCALL(HookPerformAction, ActorMediator, TESActionData* apActi
         // spdlog::debug("Action event name: {}, target name: {}", apAction->eventName.AsAscii(), apAction->targetEventName.AsAscii());
 
         // This is a weird case where it gets spammed and doesn't do much, not sure if it still needs to be sent over the network
-        if (apAction->someFlag == 1 || g_forceAnimation)
+        // These idles drive the local first-person camera, not a remote body.
+        if (apAction->someFlag == 1 || g_forceAnimation ||
+            (apAction->idleForm && (apAction->idleForm->formID == 0x10C00C || apAction->idleForm->formID == 0x10C00D)))
             return res;
 
         action.EventName = apAction->eventName.AsAscii();

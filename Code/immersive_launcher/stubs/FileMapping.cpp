@@ -243,6 +243,30 @@ NTSTATUS WINAPI TP_LdrLoadDll(const wchar_t* apPath, uint32_t* apFlags, UNICODE_
 
     return RealLdrLoadDll(apPath, apFlags, apFileName, apHandle);
 }
+
+// A second instance of the game can be pointed at a folder of its own through STR_INSTANCE_ROOT, so that it doesn't share
+// INIs, saves and its load order with the main one. The engine asks for just these two folders, in one place in the
+// executable: documents for the INIs and saves, local app data for Plugins.txt.
+constexpr int cCsidlPersonal = 0x05;
+constexpr int cCsidlLocalAppData = 0x1C;
+constexpr int cCsidlMask = 0xFF;
+
+std::string s_instanceDocuments;
+std::string s_instanceLocalAppData;
+
+using TSHGetFolderPathA = HRESULT(WINAPI)(HWND, int, HANDLE, DWORD, LPSTR);
+TSHGetFolderPathA* RealSHGetFolderPathA = nullptr;
+
+HRESULT WINAPI TP_SHGetFolderPathA(HWND apOwner, int aFolder, HANDLE apToken, DWORD aFlags, LPSTR apPath)
+{
+    if ((aFolder & cCsidlMask) == cCsidlPersonal && apPath)
+        return StringCchCopyA(apPath, MAX_PATH, s_instanceDocuments.c_str());
+
+    if ((aFolder & cCsidlMask) == cCsidlLocalAppData && apPath)
+        return StringCchCopyA(apPath, MAX_PATH, s_instanceLocalAppData.c_str());
+
+    return RealSHGetFolderPathA(apOwner, aFolder, apToken, aFlags, apPath);
+}
 } // namespace
 
 #define VALIDATE(x) \
@@ -286,6 +310,16 @@ void CoreStubsInit()
     // downcalls to LdrGetDllHandleEx, so we have to hook this too.
     VALIDATE(MH_CreateHookApi(L"kernel32.dll", "GetModuleHandleW", &TP_GetModuleHandleW, (void**)&RealGetModuleHandleW));
     VALIDATE(MH_CreateHookApi(L"kernel32.dll", "GetModuleHandleA", &TP_GetModuleHandleA, (void**)&RealGetModuleHandleA));
+
+    char instanceRoot[MAX_PATH]{};
+    const DWORD cInstanceRootLength = GetEnvironmentVariableA("STR_INSTANCE_ROOT", instanceRoot, MAX_PATH);
+    if (cInstanceRootLength > 0 && cInstanceRootLength < MAX_PATH)
+    {
+        s_instanceDocuments = std::string(instanceRoot) + "\\Documents";
+        s_instanceLocalAppData = std::string(instanceRoot) + "\\AppData\\Local";
+        LoadLibraryW(L"shell32.dll");
+        VALIDATE(MH_CreateHookApi(L"shell32.dll", "SHGetFolderPathA", &TP_SHGetFolderPathA, (void**)&RealSHGetFolderPathA));
+    }
 
     VALIDATE(MH_EnableHook(nullptr));
 }

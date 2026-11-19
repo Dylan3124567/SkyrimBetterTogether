@@ -20,6 +20,10 @@
 #include <Forms/TESObjectCELL.h>
 #include <Forms/TESWorldSpace.h>
 
+#include <Systems/NpcSyncRules.h>
+
+static_assert(NpcSyncRules::cLifeStateMask == ActorState::kLifeStateMask);
+
 void AnimationSystem::Update(World& aWorld, Actor* apActor, RemoteAnimationComponent& aAnimationComponent, const uint64_t aTick) noexcept
 {
     auto& actions = aAnimationComponent.TimePoints;
@@ -47,7 +51,7 @@ void AnimationSystem::Update(World& aWorld, Actor* apActor, RemoteAnimationCompo
         const auto pAction = Cast<BGSAction>(TESForm::GetById(actionId));
         const auto pTarget = Cast<TESObjectREFR>(TESForm::GetById(targetId));
 
-        apActor->actorState.flags1 = first.State1;
+        apActor->actorState.flags1 = NpcSyncRules::MergeReplayedState(apActor->actorState.flags1, first.State1, apActor->IsDead());
         apActor->actorState.flags2 = first.State2;
 
         apActor->LoadAnimationVariables(first.Variables);
@@ -123,6 +127,7 @@ void AnimationSystem::SerializeMovement(World& aWorld, Actor* apActor, Movement&
     aMovement.Rotation.y = apActor->rotation.z;
 
     apActor->SaveAnimationVariables(aMovement.Variables);
+    aMovement.IsHeldInPlace = apActor->actorState.IsHeldInPlace();
 
     if (apActor->currentProcess && apActor->currentProcess->middleProcess)
     {

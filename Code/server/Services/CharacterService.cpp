@@ -31,6 +31,7 @@
 #include <Messages/NewPackageRequest.h>
 #include <Messages/NotifyNewPackage.h>
 #include <Messages/RequestRespawn.h>
+#include <Messages/PlayerAppearance.h>
 #include <Messages/NotifyRespawn.h>
 #include <Messages/SyncExperienceRequest.h>
 #include <Messages/NotifySyncExperience.h>
@@ -41,10 +42,23 @@
 #include <Messages/NotifyActorTeleport.h>
 
 #include <Setting.h>
+#include <cmath>
 namespace
 {
 Console::Setting bEnableXpSync{"Gameplay:bEnableXpSync", "Syncs combat XP within the party", true};
+
+// Snapshots come every ~90 ms at worst, a client doesn't claim before its own wait of 5 seconds runs out either
+constexpr uint64_t cOwnerSilentTime = 3000;
+// iHoursToRespawnCell, the earliest a cell can bring its actors back
+constexpr int64_t cDeathRecordHours = 240;
+
+// Good enough to tell days apart, months are short of 31 days only by a day or two
+int64_t GetGameHour(const CalendarService& acCalendar) noexcept
+{
+    const auto [day, month, year] = acCalendar.GetDate();
+    return ((static_cast<int64_t>(year) * 12 + month) * 31 + day) * 24 + acCalendar.GetTime().first;
 }
+} // namespace
 
 CharacterService::CharacterService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
@@ -63,6 +77,7 @@ CharacterService::CharacterService(World& aWorld, entt::dispatcher& aDispatcher)
     , m_mountConnection(aDispatcher.sink<PacketEvent<MountRequest>>().connect<&CharacterService::OnMountRequest>(this))
     , m_newPackageConnection(aDispatcher.sink<PacketEvent<NewPackageRequest>>().connect<&CharacterService::OnNewPackageRequest>(this))
     , m_requestRespawnConnection(aDispatcher.sink<PacketEvent<RequestRespawn>>().connect<&CharacterService::OnRequestRespawn>(this))
+    , m_playerAppearanceConnection(aDispatcher.sink<PacketEvent<RequestPlayerAppearance>>().connect<&CharacterService::OnPlayerAppearance>(this))
     , m_syncExperienceConnection(aDispatcher.sink<PacketEvent<SyncExperienceRequest>>().connect<&CharacterService::OnSyncExperienceRequest>(this))
     , m_dialogueConnection(aDispatcher.sink<PacketEvent<DialogueRequest>>().connect<&CharacterService::OnDialogueRequest>(this))
     , m_subtitleConnection(aDispatcher.sink<PacketEvent<SubtitleRequest>>().connect<&CharacterService::OnSubtitleRequest>(this))
@@ -74,6 +89,7 @@ void CharacterService::Serialize(World& aRegistry, entt::entity aEntity, Charact
     const auto& characterComponent = aRegistry.get<CharacterComponent>(aEntity);
 
     apSpawnRequest->ServerId = World::ToInteger(aEntity);
+    apSpawnRequest->HelgenAliasId = characterComponent.HelgenAliasId;
     apSpawnRequest->AppearanceBuffer = characterComponent.SaveBuffer;
     apSpawnRequest->ChangeFlags = characterComponent.ChangeFlags;
     apSpawnRequest->FaceTints = characterComponent.FaceTints;
@@ -193,19 +209,23 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
     const auto isPlayer = (refId.ModId == 0 && refId.BaseId == 0x14);
     const auto isCustom = isPlayer || refId.ModId == std::numeric_limits<uint32_t>::max();
 
-    // Check if id is the player
-    if (!isCustom)
+    // Only temporary NPCs may identify themselves by a vanilla MQ101 alias.
+    if (message.HelgenAliasId && (refId.ModId != UINT32_MAX || isPlayer || message.IsPlayerSummon || message.HelgenAliasId > 179 || message.HelgenAliasId == 119))
+        return;
+
+    if (!isCustom || message.HelgenAliasId)
     {
         // Look for the character
-        auto view = m_world.view<FormIdComponent, ActorValuesComponent, CharacterComponent, MovementComponent, CellIdComponent, OwnerComponent, InventoryComponent>();
+        auto view = m_world.view<ActorValuesComponent, CharacterComponent, MovementComponent, CellIdComponent, OwnerComponent, InventoryComponent>();
 
         const auto itor = std::find_if(
             std::begin(view), std::end(view),
-            [view, refId](auto entity)
+            [this, view, refId, aliasId = message.HelgenAliasId](auto entity)
             {
-                const auto& formIdComponent = view.get<FormIdComponent>(entity);
-
-                return formIdComponent.Id == refId;
+                if (aliasId)
+                    return view.get<CharacterComponent>(entity).HelgenAliasId == aliasId;
+                const auto* pForm = m_world.try_get<FormIdComponent>(entity);
+                return pForm && pForm->Id == refId;
             });
 
         if (itor != std::end(view))
@@ -215,7 +235,21 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
             auto& ownerComponent = view.get<OwnerComponent>(*itor);
             auto& characterComponent = view.get<CharacterComponent>(*itor);
             const bool isOwner = ownerComponent.GetOwner() == acMessage.pPlayer;
-            const bool transferToLeader = !isOwner && CanClaimOwnership(acMessage.pPlayer, *itor, ownerComponent.OwnershipEpoch, OwnershipTransferReason::LeaderAssignment);
+            auto& cellComponent = view.get<CellIdComponent>(*itor);
+            const CellIdComponent arrivalCell{message.CellId, {}, {}};
+            // A delayed exterior owner must not drag the leader's door-arriving companion out of the keep.
+            // ponytail: vanilla Helgen companions/keep only; other scripted transitions need their own evidence.
+            const bool keepArrival = refId.ModId == 0 && (refId.BaseId == 0x2BF9E || refId.BaseId == 0x2BFA2) &&
+                                     cellComponent.WorldSpaceId == GameId(0, 0x3C) && !message.WorldSpaceId && message.CellId == GameId(0, 0x5DE24) &&
+                                     acMessage.pPlayer->GetCellComponent().IsInInteriorCell() && acMessage.pPlayer->GetCellComponent().Cell == message.CellId &&
+                                     std::isfinite(message.Position.x) && std::isfinite(message.Position.y) && std::isfinite(message.Position.z);
+            const bool transferToLeader = !isOwner && CanClaimOwnership(acMessage.pPlayer, *itor, ownerComponent.OwnershipEpoch, OwnershipTransferReason::LeaderAssignment, keepArrival ? &arrivalCell : nullptr);
+            if (transferToLeader && keepArrival)
+            {
+                cellComponent = arrivalCell;
+                view.get<MovementComponent>(*itor).Position = message.Position;
+                spdlog::info("Accepted Helgen companion {:X} keep arrival from party leader {:X}", refId.BaseId, acMessage.pPlayer->GetId());
+            }
 
             if (!characterComponent.LeveledNpcPickId && message.LeveledNpcPickId != GameId{})
             {
@@ -335,6 +369,12 @@ void CharacterService::OnCharacterRemoveEvent(const CharacterRemoveEvent& acEven
 
     GameServer::Get()->GetWorld().GetScriptService().HandleCharacterDestoy(*it);
 
+    // The death would go with the entity, and the next client to come by still has the actor alive in its save
+    const auto* pCharacterComponent = m_world.try_get<CharacterComponent>(*it);
+    const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(*it);
+    if (pCharacterComponent && pFormIdComponent && pCharacterComponent->IsDead())
+        m_deadActors[pFormIdComponent->Id] = GetGameHour(m_world.GetCalendarService());
+
     NotifyRemoveCharacter response;
     response.ServerId = acEvent.ServerId;
 
@@ -350,10 +390,51 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
     const auto& message = acMessage.Packet;
     const entt::entity cEntity = static_cast<entt::entity>(message.ServerId);
 
-    if (!CanClaimOwnership(acMessage.pPlayer, cEntity, message.ExpectedOwnershipEpoch, OwnershipTransferReason::LeaderClaim))
+    if (CanClaimOwnership(acMessage.pPlayer, cEntity, message.ExpectedOwnershipEpoch, OwnershipTransferReason::LeaderClaim))
+    {
+        TransferOwnership(acMessage.pPlayer, cEntity, OwnershipTransferReason::LeaderClaim);
+        return;
+    }
+
+    const auto view = m_world.view<OwnerComponent, CharacterComponent, CellIdComponent, MovementComponent>();
+    const auto it = view.find(cEntity);
+    if (it == view.end())
         return;
 
-    TransferOwnership(acMessage.pPlayer, cEntity, OwnershipTransferReason::LeaderClaim);
+    const auto& ownerComponent = view.get<OwnerComponent>(*it);
+    const auto& characterComponent = view.get<CharacterComponent>(*it);
+    const auto& cellIdComponent = view.get<CellIdComponent>(*it);
+    const auto& movementComponent = view.get<MovementComponent>(*it);
+    Player* const pOwner = ownerComponent.GetOwner();
+
+    if (pOwner == acMessage.pPlayer || characterComponent.IsMount() || characterComponent.IsPlayer() || characterComponent.IsPlayerSummon() ||
+        (!m_world.all_of<FormIdComponent>(*it) && !characterComponent.HelgenAliasId) ||
+        !acMessage.pPlayer->GetCellComponent().IsInRange(cellIdComponent, characterComponent.IsDragon()))
+    {
+        return;
+    }
+
+    // Any client around may take over an actor its owner stopped running, or left asleep while the actor woke up on that client.
+    // Handing over a sleeping actor costs nothing, and its ambush scripts only run where the AI does.
+    const bool cOwnerSilent = GameServer::Get()->GetTick() - movementComponent.LastReceived >= cOwnerSilentTime;
+    const bool cOwnerGone = !pOwner || !pOwner->GetCellComponent().IsInRange(cellIdComponent, characterComponent.IsDragon());
+    if (cOwnerSilent || cOwnerGone || movementComponent.IsHeldInPlace)
+    {
+        TransferOwnership(acMessage.pPlayer, cEntity, OwnershipTransferReason::OwnerUnavailable);
+        return;
+    }
+
+    // Nothing wrong with the owner, the client missed the update telling it who that is
+    if (message.ExpectedOwnershipEpoch != ownerComponent.OwnershipEpoch)
+    {
+        NotifyOwnershipTransfer notify{};
+        notify.ServerId = message.ServerId;
+        notify.OwnerPlayerId = pOwner->GetId();
+        notify.OwnershipEpoch = ownerComponent.OwnershipEpoch;
+        notify.CurrentActorData = BuildActorData(*it);
+        notify.LeveledNpcPickId = characterComponent.LeveledNpcPickId.Id;
+        acMessage.pPlayer->Send(notify);
+    }
 }
 
 void CharacterService::OnCharacterSpawned(const CharacterSpawnedEvent& acEvent) const noexcept
@@ -389,6 +470,9 @@ void CharacterService::OnReferencesMoveRequest(const PacketEvent<ClientReference
             continue;
         }
 
+        if (!view.get<OwnerComponent>(*itor).IsCurrentOwner(acMessage.pPlayer, movement.OwnershipEpoch))
+            continue;
+
         auto& movementComponent = view.get<MovementComponent>(*itor);
         auto& cellIdComponent = view.get<CellIdComponent>(*itor);
         const auto& characterComponent = view.get<CharacterComponent>(*itor);
@@ -398,6 +482,8 @@ void CharacterService::OnReferencesMoveRequest(const PacketEvent<ClientReference
         movementComponent.Rotation = glm::vec3(movement.Rotation.x, 0.f, movement.Rotation.y);
         movementComponent.Variables = movement.Variables;
         movementComponent.Direction = movement.Direction;
+        movementComponent.LastReceived = GameServer::Get()->GetTick();
+        movementComponent.IsHeldInPlace = movement.IsHeldInPlace;
 
         cellIdComponent.Cell = movement.CellId;
         cellIdComponent.WorldSpaceId = movement.WorldSpaceId;
@@ -525,6 +611,9 @@ void CharacterService::OnMountRequest(const PacketEvent<MountRequest>& acMessage
 void CharacterService::OnNewPackageRequest(const PacketEvent<NewPackageRequest>& acMessage) const noexcept
 {
     auto& message = acMessage.Packet;
+    const auto* pOwner = m_world.try_get<OwnerComponent>(static_cast<entt::entity>(message.ActorId));
+    if (!pOwner || pOwner->GetOwner() != acMessage.pPlayer)
+        return;
 
     NotifyNewPackage notify;
     notify.ActorId = message.ActorId;
@@ -533,6 +622,23 @@ void CharacterService::OnNewPackageRequest(const PacketEvent<NewPackageRequest>&
     const entt::entity cEntity = static_cast<entt::entity>(message.ActorId);
     if (!GameServer::Get()->SendToPlayersInRange(notify, cEntity, acMessage.GetSender()))
         spdlog::error("{}: SendToPlayersInRange failed", __FUNCTION__);
+}
+
+void CharacterService::OnPlayerAppearance(const PacketEvent<RequestPlayerAppearance>& acMessage) const noexcept
+{
+    const auto& appearance = acMessage.Packet.Appearance;
+    const auto entity = static_cast<entt::entity>(appearance.ActorId);
+    auto view = m_world.view<OwnerComponent, CharacterComponent>();
+    if (!view.contains(entity) || !view.get<OwnerComponent>(entity).IsCurrentOwner(acMessage.pPlayer, appearance.OwnershipEpoch) ||
+        !view.get<CharacterComponent>(entity).IsPlayer() || appearance.AppearanceBuffer.empty() || appearance.AppearanceBuffer.size() > 32768)
+        return;
+    auto& character = view.get<CharacterComponent>(entity);
+    character.SaveBuffer = appearance.AppearanceBuffer;
+    character.ChangeFlags = appearance.ChangeFlags;
+    character.FaceTints = appearance.FaceTints;
+    NotifyPlayerAppearance notify;
+    notify.Appearance = appearance;
+    GameServer::Get()->SendToPlayersInRange(notify, entity, acMessage.GetSender());
 }
 
 void CharacterService::OnRequestRespawn(const PacketEvent<RequestRespawn>& acMessage) const noexcept
@@ -580,11 +686,15 @@ void CharacterService::OnSyncExperienceRequest(const PacketEvent<SyncExperienceR
     if (!bEnableXpSync)
         return;
 
+    if (!acMessage.pPlayer->GetCharacter())
+        return;
+
     NotifySyncExperience notify;
     notify.Experience = acMessage.Packet.Experience;
 
+    // A kill at the other end of the map isn't a fight this player is in.
     const auto& partyComponent = acMessage.pPlayer->GetParty();
-    GameServer::Get()->SendToParty(notify, partyComponent, acMessage.GetSender());
+    GameServer::Get()->SendToPartyInRange(notify, partyComponent, *acMessage.pPlayer->GetCharacter(), acMessage.GetSender());
 }
 
 void CharacterService::OnDialogueRequest(const PacketEvent<DialogueRequest>& acMessage) const noexcept
@@ -653,6 +763,7 @@ void CharacterService::CreateCharacter(const PacketEvent<AssignCharacterRequest>
     }
 
     auto& characterComponent = m_world.emplace<CharacterComponent>(cEntity);
+    characterComponent.HelgenAliasId = message.HelgenAliasId;
     characterComponent.ChangeFlags = message.ChangeFlags;
     characterComponent.SaveBuffer = std::move(message.AppearanceBuffer);
     characterComponent.BaseId = FormIdComponent(message.FormId);
@@ -664,7 +775,17 @@ void CharacterService::CreateCharacter(const PacketEvent<AssignCharacterRequest>
         spdlog::debug("Stored leveled NPC pick {:x}:{:x} for FormId {:x}:{:x}", message.LeveledNpcPickId.ModId, message.LeveledNpcPickId.BaseId, gameId.ModId, gameId.BaseId);
     characterComponent.FaceTints = message.FaceTints;
     characterComponent.FactionsContent = message.FactionsContent;
-    characterComponent.SetDead(message.CurrentActorData.IsDead);
+    bool isDead = message.CurrentActorData.IsDead;
+    if (!isCustom)
+    {
+        if (const auto deathIt = m_deadActors.find(gameId); deathIt != m_deadActors.end())
+        {
+            isDead = isDead || GetGameHour(m_world.GetCalendarService()) - deathIt->second < cDeathRecordHours;
+            m_deadActors.erase(deathIt);
+        }
+    }
+
+    characterComponent.SetDead(isDead);
     characterComponent.SetPlayer(isPlayer);
     characterComponent.SetWeaponDrawn(message.CurrentActorData.IsWeaponDrawn);
     characterComponent.SetDragon(message.IsDragon);
@@ -681,6 +802,7 @@ void CharacterService::CreateCharacter(const PacketEvent<AssignCharacterRequest>
 
     auto& movementComponent = m_world.emplace<MovementComponent>(cEntity);
     movementComponent.Tick = pServer->GetTick();
+    movementComponent.LastReceived = pServer->GetTick();
     movementComponent.Position = message.Position;
     movementComponent.Rotation = {message.Rotation.x, 0.f, message.Rotation.y};
 
@@ -774,11 +896,11 @@ const char* CharacterService::GetOwnershipTransferReasonName(const OwnershipTran
     return "unknown reason";
 }
 
-bool CharacterService::CanClaimOwnership(Player* apPlayer, const entt::entity aEntity, const uint32_t aExpectedOwnershipEpoch, const OwnershipTransferReason aReason) const noexcept
+bool CharacterService::CanClaimOwnership(Player* apPlayer, const entt::entity aEntity, const uint32_t aExpectedOwnershipEpoch, const OwnershipTransferReason aReason, const CellIdComponent* apArrivalCell) const noexcept
 {
     const uint32_t serverId = World::ToInteger(aEntity);
     const char* pReasonName = GetOwnershipTransferReasonName(aReason);
-    const auto view = m_world.view<OwnerComponent, CharacterComponent, CellIdComponent, FormIdComponent>();
+    const auto view = m_world.view<OwnerComponent, CharacterComponent, CellIdComponent>();
     const auto it = view.find(aEntity);
     if (it == view.end())
     {
@@ -806,10 +928,11 @@ bool CharacterService::CanClaimOwnership(Player* apPlayer, const entt::entity aE
     if (!pCurrentOwner || pCurrentOwner == apPlayer)
         return reject("the player already owns the actor");
 
-    if (characterComponent.IsMount() || characterComponent.IsPlayer())
+    if (characterComponent.IsMount() || characterComponent.IsPlayer() ||
+        (!m_world.all_of<FormIdComponent>(aEntity) && !characterComponent.HelgenAliasId))
         return reject("the actor cannot be claimed");
 
-    if (!apPlayer->GetCellComponent().IsInRange(cellIdComponent, characterComponent.IsDragon()))
+    if (!apPlayer->GetCellComponent().IsInRange(apArrivalCell ? *apArrivalCell : cellIdComponent, characterComponent.IsDragon()))
         return reject("the actor is out of range");
 
     auto& partyService = m_world.GetPartyService();
@@ -856,6 +979,12 @@ bool CharacterService::TransferOwnership(Player* apPlayer, const entt::entity aE
     ownerComponent.OwnershipEpoch = newEpoch;
     if (aResetInvalidOwners)
         ownerComponent.InvalidOwners.clear();
+
+    if (auto* pMovementComponent = m_world.try_get<MovementComponent>(aEntity))
+    {
+        pMovementComponent->LastReceived = GameServer::Get()->GetTick();
+        pMovementComponent->IsHeldInPlace = false;
+    }
 
     if (!GameServer::Get()->SendToPlayersInRange(notify, aEntity, pOldOwner))
         spdlog::error("Failed to broadcast ownership transfer for actor {:X}", notify.ServerId);

@@ -19,9 +19,11 @@ bool QuestLog::operator!=(const QuestLog& acRhs) const noexcept
 
 void QuestLog::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
 {
-    aWriter.WriteBits(Entries.size() & 0xFFFF, 16);
-    for (auto& e : Entries)
+    const size_t count = std::min(Entries.size(), size_t{0xFFFF});
+    aWriter.WriteBits(count, 16);
+    for (size_t i = 0; i < count; ++i)
     {
+        const auto& e = Entries[i];
         e.Id.Serialize(aWriter);
 
         // id's can be in the full 16 bit range

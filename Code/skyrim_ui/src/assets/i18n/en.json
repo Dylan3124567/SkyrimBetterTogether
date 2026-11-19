@@ -9,21 +9,22 @@
     },
     "CONNECT": {
       "INFO": {
-        "SERVER_ADDRESS": "Connect to a server using its full address. Use the format <strong>address:port</strong>. The port defaults to <strong>10578</strong>.",
-        "HELGEN": "Do NOT connect to any server if you are still in the Helgen intro sequence. Make sure you just escaped Helgen first."
+        "SERVER_ADDRESS": "Paste the address your friend shared. The default port is 10578.",
+        "HELGEN": "Shared Helgen: both players join at character creation, then finish and name their characters. The intro waits for everyone. Follow the same companion into the keep."
       },
       "ADDRESS": "Address",
       "PASSWORD": "Password",
       "SAVE_PASSWORD": "Save Password?",
       "HIDE_PASSWORD": "Hide Password?",
-      "CONNECT": "Connect",
+      "CONNECT": "Join game",
       "CANCEL": "Cancel",
       "PUBLIC_SERVERS": "Public servers",
       "ERROR": {
-        "CONNECTION": "Could not connect to the specified server. Please make sure you've entered the correct address and that you're not experiencing network issues",
+        "CONNECTION": "Could not join. Check that your friend is hosting, the address and password are correct, and the same mod build is installed. For Internet play, the host needs UPnP or UDP port forwarding and a firewall rule allowing the server.",
         "VERSION_MISMATCH": "You cannot connect to the server because it does not have the same version of Skyrim Together as you.",
-        "INVALID_ADDRESS": "The address is of invalid format."
-      }
+        "INVALID_ADDRESS": "Enter a hostname or IP address, optionally followed by :port (1-65535). Use [IPv6]:port for IPv6."
+      },
+      "JOINING": "Joining..."
     },
     "DISCONNECT": {
       "PROMPT": "Are you sure you want to disconnect?",
@@ -82,11 +83,12 @@
       "BACK": "Back"
     },
     "ROOT": {
-      "CONNECT": "Connect",
+      "MULTIPLAYER": "Multiplayer",
+      "CONNECT": "Join game",
       "DISCONNECT": "Disconnect",
       "REVEAL_PLAYERS": "Reveal Players",
       "RECONNECT": "Reconnect",
-      "PLAYER_MANAGER": "Player Manager",
+      "PLAYER_MANAGER": "Players & party",
       "SETTINGS": "Settings",
       "CONNECTION_IN_PROGRESS": "Connection in progress..."
     },
@@ -184,5 +186,26 @@
     "PARTY_HINT": {
       "MESSAGE": "Want to quest together? Form a party and stay close to share quest progress! Check out our play guide to learn more."
     }
+  },
+  "HOST": {
+    "TITLE": "Host game",
+    "INTRO": "Start a private game on this PC, then share its address and password with your friends.",
+    "PASSWORD": "Session password",
+    "PASSWORD_HELP": "Share this with your friends. Use 1-64 English letters, numbers, spaces or symbols. Longer passwords are harder to guess.",
+    "INTERNET": "Allow friends to join over the Internet",
+    "ADVANCED": "Advanced",
+    "PORT": "Game port (UDP)",
+    "DISCONNECT_FIRST": "Disconnect from the current server before hosting.",
+    "START": "Start hosting",
+    "SHARE_ADDRESS": "Internet address to share",
+    "COPY": "Copy address",
+    "COPIED": "Address copied",
+    "COPY_FALLBACK": "Select the address and press Ctrl+C to copy it.",
+    "LAN_ADDRESS": "Address for friends on your home network",
+    "JOIN_LOCAL": "Join your server",
+    "STOP": "Stop hosting",
+    "STOP_HELP": "Stopping hosting or closing Skyrim disconnects everyone.",
+    "PLAY_TIP": "For shared Helgen, both players start New Game and join at character creation before confirming their names. Follow the same companion into the keep. You can also join using matching post-Helgen saves.",
+    "CLOSE": "Back to game"
   }
 }

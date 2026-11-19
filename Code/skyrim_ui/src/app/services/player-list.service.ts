@@ -45,6 +45,7 @@ export class PlayerListService implements OnDestroy {
     this.connectionSubscription.unsubscribe();
     this.playerConnectedSubscription.unsubscribe();
     this.playerDisconnectedSubscription.unsubscribe();
+    this.memberKickedSubscription.unsubscribe();
     this.cellSubscription.unsubscribe();
     this.partyInviteReceivedSubscription.unsubscribe();
   }
@@ -74,7 +75,9 @@ export class PlayerListService implements OnDestroy {
         const playerList = this.getPlayerList();
 
         if (playerList) {
-          playerList.players.push(player);
+          const existing = playerList.players.find(other => other.id === player.id);
+          if (existing) existing.name = player.name;
+          else playerList.players.push(player);
 
           this.playerList.next(playerList);
         }
@@ -101,11 +104,11 @@ export class PlayerListService implements OnDestroy {
   private onMemberKicked() {
     this.memberKickedSubscription =
       this.clientService.memberKickedChange.subscribe((playerId: number) => {
-        const playerList = this.getPlayerList();
-        const players = playerList.players.find(
-          player => player.id !== playerId,
-        );
-        players.hasBeenInvited = false;
+        const player = this.getPlayerById(playerId);
+        if (player) {
+          player.hasBeenInvited = false;
+          this.updatePlayerList();
+        }
       });
   }
 
@@ -132,6 +135,7 @@ export class PlayerListService implements OnDestroy {
 
           if (playerList) {
             const invitingPlayer = this.getPlayerById(inviterId);
+            if (!invitingPlayer) return;
             invitingPlayer.hasInvitedLocalPlayer = true;
             this.playerList.next(playerList);
             this.popupNotificationService.addPartyInvite(
@@ -171,8 +175,9 @@ export class PlayerListService implements OnDestroy {
   public sendPartyInvite(inviteeId: number) {
     const playerList = this.getPlayerList();
 
-    if (playerList) {
-      this.getPlayerById(inviteeId).hasBeenInvited = true;
+    const invitee = this.getPlayerById(inviteeId);
+    if (playerList && invitee) {
+      invitee.hasBeenInvited = true;
 
       this.updatePlayerList();
 
@@ -183,8 +188,9 @@ export class PlayerListService implements OnDestroy {
   public acceptPartyInvite(inviterId: number) {
     const playerList = this.getPlayerList();
 
-    if (playerList) {
-      this.getPlayerById(inviterId).hasInvitedLocalPlayer = false;
+    const inviter = this.getPlayerById(inviterId);
+    if (playerList && inviter) {
+      inviter.hasInvitedLocalPlayer = false;
 
       this.clientService.acceptPartyInvite(inviterId);
 

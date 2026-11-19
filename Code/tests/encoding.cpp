@@ -402,6 +402,7 @@ TEST_CASE("Packets", "[encoding.packets]")
 
         AssignCharacterRequest sendMessage, recvMessage;
         sendMessage.Cookie = 14523698;
+        sendMessage.HelgenAliasId = 152;
         sendMessage.AppearanceBuffer = "toto";
         sendMessage.CellId.BaseId = 45;
         sendMessage.FormId.ModId = 48;
@@ -551,4 +552,15 @@ TEST_CASE("StringCache", "[encoding.string_cache]")
 
         REQUIRE(update == recvUpdate);
     }
+}
+
+TEST_CASE("Default network form IDs are empty even in reused memory", "[encoding.gameid]")
+{
+    alignas(GameId) unsigned char storage[sizeof(GameId)];
+    std::fill(std::begin(storage), std::end(storage), 0xA5);
+    auto* id = new (storage) GameId;
+    REQUIRE(id->BaseId == 0);
+    REQUIRE(id->ModId == 0);
+    REQUIRE_FALSE(static_cast<bool>(*id));
+    id->~GameId();
 }

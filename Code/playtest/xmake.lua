@@ -1,0 +1,5 @@
+target("PlaytestBridge")
+    set_kind("shared")
+    set_default(false)
+    add_files("Bridge.cpp")
+    add_syslinks("advapi32", "user32", "d3d11", "dxgi")

@@ -7,6 +7,7 @@
 #include <Services/ImguiService.h>
 
 #include <d3d11.h>
+#include <Playtest.h>
 
 RenderSystemD3D11::RenderSystemD3D11(OverlayService& aOverlay, ImguiService& aImguiService)
     : m_pSwapChain(nullptr)
@@ -49,6 +50,7 @@ void RenderSystemD3D11::OnRender()
 {
     m_imguiService.Render();
     m_overlay.Render();
+    Playtest::Capture(m_pSwapChain);
 }
 
 void RenderSystemD3D11::OnReset(IDXGISwapChain* apSwapChain)

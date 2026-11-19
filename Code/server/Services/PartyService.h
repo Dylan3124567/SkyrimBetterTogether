@@ -1,6 +1,9 @@
 #pragma once
 
 #include <Events/PacketEvent.h>
+#include <Structs/HelgenBarrier.h>
+#include <Structs/QuestSharing.h>
+struct RequestHelgenReady;
 
 struct World;
 struct UpdateEvent;
@@ -24,8 +27,9 @@ struct PartyService
         uint32_t LeaderPlayerId;
         Vector<Player*> Members;
         GameId CachedWeather{};
-        // Stages each quest reached since it started, as relayed to the party
-        Map<GameId, TiltedPhoques::Set<uint16_t>> QuestStages{};
+        // What was relayed of each quest, forgotten when members change: see QuestSharing.h
+        Map<GameId, QuestSharing::Run> QuestRuns{};
+        HelgenBarrier Helgen;
     };
 
     PartyService(World& aWorld, entt::dispatcher& aDispatcher) noexcept;
@@ -71,4 +75,7 @@ private:
     entt::scoped_connection m_partyKickConnection;
 
     void SendPartyJoinedEvent(Party& aParty, Player* aPlayer) noexcept;
+    void OnHelgenReady(const PacketEvent<RequestHelgenReady>&) noexcept;
+    void BroadcastHelgenState(uint32_t aPartyId) noexcept;
+    entt::scoped_connection m_helgenConnection;
 };

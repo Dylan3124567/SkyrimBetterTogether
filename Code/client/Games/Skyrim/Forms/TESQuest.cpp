@@ -1,3 +1,4 @@
+#include <Services/HelgenService.h>
 #include <Forms/TESQuest.h>
 
 #include <Services/PapyrusService.h>
@@ -13,6 +14,13 @@ TESObjectREFR* TESQuest::GetAliasedRef(uint32_t aAliasID) noexcept
     TiltedPhoques::ThisCall(getAliasedRef, this, &result, aAliasID);
 
     return TESObjectREFR::GetByHandle(result.handle.iBits);
+}
+
+void TESQuest::ForceRefIntoAlias(uint32_t aAliasId, TESObjectREFR* apRef) noexcept
+{
+    TP_THIS_FUNCTION(TForceRefIntoAlias, void, TESQuest, uint32_t, TESObjectREFR*);
+    POINTER_SKYRIMSE(TForceRefIntoAlias, forceRefIntoAlias, 25052);
+    TiltedPhoques::ThisCall(forceRefIntoAlias, this, aAliasId, apRef);
 }
 
 TESQuest::State TESQuest::getState()
@@ -135,9 +143,22 @@ uint32_t TESQuest::GetStageItemCount(uint16_t aStage) noexcept
     return 0;
 }
 
+// Address Library 24126 advances scene phases; verified against 1.7.104 in scene-update-disassembly.txt.
+// Suspending only this scene leaves actor loading and character previews running.
+TP_THIS_FUNCTION(TUpdateScene, void, BGSScene);
+TUpdateScene* RealUpdateScene = nullptr;
+void TP_MAKE_THISCALL(HookUpdateScene, BGSScene)
+{
+    if (!HelgenService::HoldScene(apThis->formID) && World::Get().ctx().at<HelgenService>().PrepareSceneUpdate(apThis))
+        TiltedPhoques::ThisCall(RealUpdateScene, apThis);
+}
+
 static TiltedPhoques::Initializer s_questInitHooks(
     []()
     {
+        POINTER_SKYRIMSE(TUpdateScene, updateScene, 24126);
+        RealUpdateScene = updateScene.Get();
+        TP_HOOK(&RealUpdateScene, HookUpdateScene);
         // kill quest init in cold blood
         // TiltedPhoques::Write<uint8_t>(25003, 0xC3);
     });

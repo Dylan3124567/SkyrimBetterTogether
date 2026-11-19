@@ -78,7 +78,8 @@ void ActorValueService::OnHealthChangeBroadcast(const PacketEvent<RequestHealthC
 {
     auto& message = acMessage.Packet;
 
-    // TODO(cosideci): should server side health not be updated?
+    if (!std::isfinite(message.DeltaHealth))
+        return;
     auto actorValuesView = m_world.view<ActorValuesComponent, OwnerComponent>();
 
     auto it = actorValuesView.find(static_cast<entt::entity>(message.Id));
@@ -87,7 +88,7 @@ void ActorValueService::OnHealthChangeBroadcast(const PacketEvent<RequestHealthC
     {
         auto& actorValuesComponent = actorValuesView.get<ActorValuesComponent>(*it);
         auto currentHealth = actorValuesComponent.CurrentActorValues.ActorValuesList[24];
-        actorValuesComponent.CurrentActorValues.ActorValuesList[24] = currentHealth - message.DeltaHealth;
+        actorValuesComponent.CurrentActorValues.ActorValuesList[24] = currentHealth + message.DeltaHealth;
     }
 
     NotifyHealthChangeBroadcast notify;

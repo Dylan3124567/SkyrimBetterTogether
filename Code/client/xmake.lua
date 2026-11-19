@@ -47,6 +47,7 @@ target(name)
     )
 
     add_packages(
+        "miniupnpc",
         "tiltedcore",
         "spdlog",
         "hopscotch-map",

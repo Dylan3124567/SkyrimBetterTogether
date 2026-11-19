@@ -40,6 +40,9 @@ export class RootComponent implements OnInit {
   view$ = this.uiRepository.view$;
 
   connected$ = this.client.connectionStateChange.asObservable();
+  helgenStatus$ = this.client.helgenStatus.asObservable();
+  menuShortcut$ = this.client.menuShortcut.asObservable();
+  returnToGame(): void { this.client.deactivate(); }
   menuOpen$ = this.client.openingMenuChange.asObservable();
   inGame$ = this.client.inGameStateChange.asObservable();
   active$ = this.client.activationStateChange.asObservable();

@@ -41,16 +41,16 @@ void TP_MAKE_THISCALL(HookSpellCast, ActorMagicCaster, bool abSuccess, int32_t a
     }
 
     if (apSpell)
-        World::Get().GetRunner().Trigger(SpellCastEvent(apThis, apSpell->formID, targetFormId));
+        World::Get().GetRunner().Trigger(SpellCastEvent(apThis->pCasterActor->formID, apThis->GetCastingSource(), apThis->GetIsDualCasting(), apSpell->formID, targetFormId));
 
     TiltedPhoques::ThisCall(RealSpellCast, apThis, abSuccess, auiTargetCount, apSpell);
 }
 
 void TP_MAKE_THISCALL(HookInterruptCast, ActorMagicCaster, bool abRefund)
 {
-    ActorExtension* pExtended = apThis->pCasterActor->GetExtension();
+    ActorExtension* pExtended = apThis->pCasterActor ? apThis->pCasterActor->GetExtension() : nullptr;
 
-    if (pExtended->IsLocal())
+    if (pExtended && pExtended->IsLocal())
         World::Get().GetRunner().Trigger(InterruptCastEvent(apThis->pCasterActor->formID, apThis->eCastingSource));
 
     TiltedPhoques::ThisCall(RealInterruptCast, apThis, abRefund);

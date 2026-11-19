@@ -1,5 +1,6 @@
 
 #include <Services/TransportService.h>
+#include <Services/HelgenService.h>
 
 #include <Events/ConnectedEvent.h>
 #include <Events/ConnectionErrorEvent.h>
@@ -32,10 +33,18 @@ static constexpr wchar_t kMO2DllName[] = L"usvfs_x64.dll";
 
 using TiltedPhoques::Packet;
 
+// The networking library says why a connection failed only here. Without this a failure leaves nothing but a reason code.
+static void LogNetworkingMessage(ESteamNetworkingSocketsDebugOutputType aType, const char* apMessage)
+{
+    spdlog::warn("Networking ({}): {}", static_cast<int>(aType), apMessage);
+}
+
 TransportService::TransportService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
     , m_dispatcher(aDispatcher)
 {
+    SteamNetworkingUtils()->SetDebugOutputFunction(k_ESteamNetworkingSocketsDebugOutputType_Msg, &LogNetworkingMessage);
+
     m_updateConnection = m_dispatcher.sink<UpdateEvent>().connect<&TransportService::HandleUpdate>(this);
     m_settingsChangeConnection = m_dispatcher.sink<NotifySettingsChange>().connect<&TransportService::HandleNotifySettingsChange>(this);
     m_connectedConnection = m_dispatcher.sink<ConnectedEvent>().connect<&TransportService::HandleConnected>(this);
@@ -64,6 +73,19 @@ TransportService::TransportService(World& aWorld, entt::dispatcher& aDispatcher)
         const auto pRealMessage = TiltedPhoques::CastUnique<AuthenticationResponse>(std::move(apMessage));
         HandleAuthenticationResponse(*pRealMessage);
     };
+}
+
+bool TransportService::Connect(const std::string& acEndpoint) noexcept
+{
+    spdlog::info("Connecting to {}", acEndpoint);
+
+    auto& helgen = m_world.ctx().at<HelgenService>();
+    if (!helgen.PrepareConnection())
+        return false;
+    if (Client::Connect(acEndpoint))
+        return true;
+    helgen.Cancel();
+    return false;
 }
 
 bool TransportService::Send(const ClientMessage& acMessage, const TiltedPhoques::EPacketFlags aPacketFlags) const noexcept

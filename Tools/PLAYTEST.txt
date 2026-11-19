@@ -1,0 +1,125 @@
+SKYRIM PLAYTEST BRIDGE (experimental, local only)
+
+PlaytestBridge.dll is an optional add-on for this custom Skyrim Together build.
+It is not a standalone SKSE plugin. The matching client adapter is required.
+Normal launches do not load it. Start-Playtest.ps1 sets STR_PLAYTEST=1 only for
+the launched process; -Instances 2 launches two independently controlled games.
+Add -Background to use a separate, non-displayed Windows desktop. The launcher
+keeps that desktop alive until both games exit; it never switches desktops.
+This supports bridge input and game screenshots without taking desktop focus.
+Allow startup/loading to finish before issuing commands. Loading can exceed the
+default five-second command timeout; a timeout is not evidence that an action
+was not applied. Observe status before retrying any action.
+
+From TiltedEvolution, with the PID printed by the launcher:
+  python Tools/playtest.py list
+  python Tools/playtest.py --pid PID claim
+  python Tools/playtest.py --pid PID status
+  python Tools/playtest.py --pid PID key enter
+  python Tools/playtest.py --pid PID key w shift --ms 500
+  python Tools/playtest.py --pid PID move forward --ms 500
+  python Tools/playtest.py --pid PID look 100 -30
+  python Tools/playtest.py --pid PID mouse 100 30
+  python Tools/playtest.py --pid PID raw "cursor 900 500"
+  python Tools/playtest.py --pid PID click left
+  python Tools/playtest.py --pid PID type "Test character"
+  python Tools/playtest.py --pid PID screenshot
+  python Tools/playtest.py --pid PID stop
+
+Import send/press/type_text from playtest.py for test scripts. Movement follows
+the default WASD bindings; raw input takes DirectInput scan codes for remapped
+controls. Mouse deltas feed the game; they never move the Windows pointer.
+Looking follows Skyrim's normal camera controls, including scripted restrictions.
+This does not bypass a cutscene's movement lock or provide arbitrary bone posing.
+Cursor coordinates use Skyrim's menu cursor space; status reports that position.
+Status also reports MQ101 stage, menus, health, bleedout, control flags and
+first_person (the actual PlayerCamera state),
+so scripts can assert recovery without inferring it from a screenshot.
+Read-only diagnostics: raw "scene 20167" reports a scene's active actions;
+raw "alias 3372B 152" reports a quest actor's identity, health and position.
+raw "activation" reports how often an NPC activation unloaded its process state.
+Form IDs are hexadecimal; alias IDs are decimal. These diagnostics never change quests.
+Screenshots come from the game's Direct3D backbuffer, not the desktop, and are
+saved to SkyrimTogetherReborn/playtest/PID/frame.bmp. They overwrite that frame.
+
+Multiplayer overlay (CEF) has its own cursor and direct event methods:
+  raw "overlay 1"                     open (requires an in-game session)
+  raw "ui_mouse 400 300 -1 0"         move overlay cursor
+  raw "ui_mouse 400 300 0 1"          left button down
+  raw "ui_mouse 400 300 0 0"          left button up
+  raw "ui_key 0 65 0"                 raw keydown, virtual-key code, modifiers
+  raw "ui_key 2 65 0"                 keyup
+  raw "ui_key 3 97 0"                 character 'a'
+  raw "overlay 0"                     close
+CEF buttons: 0 left, 1 middle, 2 right. These events never enter Windows input.
+
+Each process owns one named pipe, SkyrimPlaytest-PID. Its ACL grants access only
+to the current Windows user, and remote pipe clients are rejected. There is no
+listening TCP port, shell execution, arbitrary memory command, or external input
+injection. One controller request is serviced at a time; abandoned requests are
+discarded. Keyboard/mouse holds are bounded to five seconds. After 30 seconds
+without a control command the lease expires. Read-only status/capture do not
+renew it. Claim again when continuing a test. F12 or the stop command releases
+controls, allowing 250 ms for button-up events to reach the game. During a hard
+game-thread hang the bridge cannot process commands; terminate that test process.
+
+Use isolated test saves. The bridge does not make quest scripts, saves, or shared
+Helgen inherently safe. Verify gameplay outcomes from state and captured frames.
+Normal launches retain normal physical input; stop also returns physical input.
+
+Build with the existing xmake configuration:
+  xmake build -y -j4 PlaytestBridge
+  xmake build -y -j4 SkyrimImmersiveLauncher
+  python Tools/test_playtest.py PATH/TO/PlaytestBridge.dll
+Install PlaytestBridge.dll and the matching SkyrimTogether.exe together into
+Data/SkyrimTogetherReborn while the game is closed. Keep the backed-up executable.
+
+Engine assumptions: this uses existing STR input-poll/render hooks and
+Address Library IDs. Mouse event/cache and MenuCursor layouts follow the primary
+powerof3/CommonLibSSE AE sources listed below. No IDA/Ghidra verification was available;
+the paths below were exercised on the installed 1.7.104 game, but this is not
+a disassembly audit or a guarantee for other game versions.
+  https://github.com/powerof3/CommonLibSSE/blob/dev/src/RE/B/BSInputEventQueue.cpp
+  https://github.com/powerof3/CommonLibSSE/blob/dev/include/RE/B/BSInputEventQueue.h
+  https://github.com/powerof3/CommonLibSSE/blob/dev/include/RE/M/MenuCursor.h
+  https://github.com/powerof3/CommonLibSSE/blob/dev/src/RE/M/MenuCursor.cpp
+
+VERIFIED ON 2026-10-23, SKYRIM 1.7.104
+Built and installed the matching client and bridge. The actual game loaded an
+isolated copy of an existing save, moved 257.12 game units, and changed camera
+pitch/yaw. Menu cursor movement/clicks, console text, multiplayer overlay clicks
+and address entry, and game-owned frame capture worked. Controlling a second
+instance left the first instance state unchanged. A 100,50 cursor delta moved
+the menu cursor exactly 100,50. Stopping a five-second held movement stopped
+the player; subsequent position drift was zero. Windows cursor coordinates
+were unchanged during the movement/look and release tests.
+
+The actual bridge DLL/pipe checks passed validation, reconnection, buffered input,
+mouse input, timed release, held-key stop, and 30-second lease expiry. Existing
+C++ regressions passed 3415 assertions in 19 cases. Physical F12 was not manually
+pressed; command stop and automatic expiry were tested. These results do not
+prove two-player Helgen or every menu/quest; that gameplay test remains open.
+
+Evidence is in ../../validation/playtest relative to this document. Both owned
+test games were closed, the pre-bridge test profile restored, and all nine
+original save-directory files were verified unchanged against the backup.
+
+READ-ONLY SCENE DIAGNOSTICS
+  python Tools/playtest.py --pid PID claim
+  python Tools/playtest.py --pid PID raw "scene 20167"
+Returns playing state, phase, and current action completion from existing STR
+scene structures. Use to distinguish a blocked NPC package from quest progress.
+Invalid or unknown scene IDs return an error. No stage or scene is changed.
+
+VANILLA CONTROL BASELINE
+STR_PLAYTEST=1 plus STR_PLAYTEST_BASELINE=1 installs only the control input and
+frame-capture hooks. It skips multiplayer services, gameplay hooks and SKSE.
+Use a separate game data tree without Together ESPs or loose gameplay assets,
+an empty plugin list, and a fresh isolated save profile. The baseline flag alone
+does not remove gameplay assets from a shared Data folder. Never load an STR save
+to establish vanilla quest behavior. Status reports baseline=true, online=false.
+The local test helper supports: python Tools/start_playtest_background.py 1 --baseline
+It uses A:/SkyrimMultiplayerBuild/vanilla-control-game and the same non-displayed
+desktop as the multiplayer clients. It never switches the visible desktop.
+Background New Game input and the vanilla cart ride were verified on 1.7.104;
+full quest parity still requires comparing the actual progression.

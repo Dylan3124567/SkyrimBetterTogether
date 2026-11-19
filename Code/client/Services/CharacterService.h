@@ -1,6 +1,7 @@
 #pragma once
 #include "Structs/Inventory.h"
 #include "Structs/ActorData.h"
+#include <Messages/PlayerAppearance.h>
 
 struct ActorAddedEvent;
 struct ActorRemovedEvent;
@@ -77,6 +78,7 @@ struct CharacterService
     void OnInitPackageEvent(const InitPackageEvent& acEvent) const noexcept;
     void OnNotifyNewPackage(const NotifyNewPackage& acMessage) const noexcept;
     void OnNotifyRespawn(const NotifyRespawn& acMessage) const noexcept;
+    void OnPlayerAppearance(const NotifyPlayerAppearance& acMessage) const noexcept;
     void OnBeastFormChange(const BeastFormChangeEvent& acEvent) const noexcept;
     void OnAddExperienceEvent(const AddExperienceEvent& acEvent) noexcept;
     void OnNotifySyncExperience(const NotifySyncExperience& acMessage) noexcept;
@@ -87,10 +89,14 @@ struct CharacterService
     void OnNotifyActorTeleport(const NotifyActorTeleport& acMessage) noexcept;
     void OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept;
 
+    void RunAppearanceUpdates(bool aForce = false) noexcept;
     void ProcessNewEntity(entt::entity aEntity) const noexcept;
 
+    bool MoveActor(const Actor* apActor, const GameId& acWorldSpaceId, const GameId& acCellId, const Vector3_NetQuantize& acPosition) const noexcept;
+    // Forces the death action, waiting until the actor can play it
+    void KillWhenReady(Actor* apActor) const noexcept;
+
 private:
-    void MoveActor(const Actor* apActor, const GameId& acWorldSpaceId, const GameId& acCellId, const Vector3_NetQuantize& acPosition) const noexcept;
 
     void RequestServerAssignment(entt::entity aEntity) const noexcept;
     void CancelServerAssignment(entt::entity aEntity, uint32_t aFormId) const noexcept;
@@ -102,9 +108,13 @@ private:
     ActorData BuildActorData(Actor* apActor) const noexcept;
     void ApplyLeveledNpcPick(Actor* apActor, const GameId& acPickId) const noexcept;
     void ProcessLeveledConforms() noexcept;
+    void ProcessPendingDeaths() noexcept;
+    void ProcessAppearanceUpdates() noexcept;
 
     void RunLocalUpdates() const noexcept;
     void RunRemoteUpdates() noexcept;
+    void RunThoraldUpdates() const noexcept;
+    void RunSceneUpdates() noexcept;
     void RunFactionsUpdates() const noexcept;
     void RunSpawnUpdates() const noexcept;
     void RunExperienceUpdates() noexcept;
@@ -115,6 +125,15 @@ private:
     TransportService& m_transport;
 
     float m_cachedExperience = 0.f;
+    mutable PlayerAppearance m_lastAppearance;
+    double m_nextAppearance{};
+    struct PendingAppearance
+    {
+        PlayerAppearance Latest;
+        std::optional<PlayerAppearance> Applied;
+        bool Disabling = false;
+    };
+    mutable Map<uint32_t, PendingAppearance> m_pendingAppearances;
 
     // TODO: revamp this, read the local anim var like vampire lord?
     struct WeaponDrawData
@@ -136,6 +155,23 @@ private:
     // Written from const message handlers, drained by ProcessLeveledConforms.
     mutable Map<uint32_t, uint32_t> m_pendingLeveledConforms{};
 
+    // Actors that died before this client got there, killed once their behavior graph can take the death action
+    mutable Set<uint32_t> m_pendingDeaths{};
+
+    struct VoiceLine
+    {
+        String File;
+        double Time{};
+    };
+    mutable Map<uint32_t, VoiceLine> m_lastVoiceLines{};
+
+    struct SceneHold
+    {
+        double Start{-1.0};
+        uint64_t ReleasedPhase{};
+    };
+    mutable Map<uint32_t, SceneHold> m_sceneHolds{};
+
     entt::scoped_connection m_referenceAddedConnection;
     entt::scoped_connection m_referenceRemovedConnection;
     entt::scoped_connection m_updateConnection;
@@ -154,6 +190,7 @@ private:
     entt::scoped_connection m_initPackageConnection;
     entt::scoped_connection m_newPackageConnection;
     entt::scoped_connection m_notifyRespawnConnection;
+    entt::scoped_connection m_playerAppearanceConnection;
     entt::scoped_connection m_beastFormChangeConnection;
     entt::scoped_connection m_addExperienceEventConnection;
     entt::scoped_connection m_syncExperienceConnection;

@@ -92,8 +92,8 @@ void InterpolationSystem::Update(Actor* apActor, InterpolationComponent& aInterp
     aInterpolationComponent.IsExtrapolating = isExtrapolating;
     aInterpolationComponent.Position = position + positionError;
 
-    // Don't try to move a null actor
-    if (!apActor)
+    // Don't try to move a null actor. A corpse is a ragdoll, held at the owner's reference point it sank or jittered.
+    if (!apActor || apActor->IsDead())
         return;
 
     apActor->ForcePosition(aInterpolationComponent.Position);

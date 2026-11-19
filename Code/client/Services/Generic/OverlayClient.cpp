@@ -1,10 +1,10 @@
 #include <TiltedOnlinePCH.h>
 
 #include <OverlayRenderHandler.hpp>
-#include <DInputHook.hpp>
 
 #include <Services/OverlayClient.h>
 #include <Services/TransportService.h>
+#include <Services/HelgenService.h>
 
 #include <Messages/SendChatMessageRequest.h>
 #include <Messages/TeleportRequest.h>
@@ -12,6 +12,7 @@
 #include <Events/SetTimeCommandEvent.h>
 
 #include <World.h>
+#include <TiltedCore/Filesystem.hpp>
 
 OverlayClient::OverlayClient(TransportService& aTransport, TiltedPhoques::OverlayRenderHandler* apHandler)
     : TiltedPhoques::OverlayClient(apHandler)
@@ -32,10 +33,8 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
         auto eventName = pArguments->GetString(0).ToString();
         auto eventArgs = pArguments->GetList(1);
 
-        spdlog::info(eventName);
-        spdlog::info(eventArgs->GetString(0).ToString());
-        spdlog::info(std::to_string(eventArgs->GetInt(1)));
-        spdlog::info(eventArgs->GetString(2).ToString());
+        if (!eventArgs)
+            return false;
 
 #ifndef PUBLIC_BUILD
         LOG(INFO) << "event=ui_event name=" << eventName;
@@ -43,6 +42,31 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
 
         if (eventName == "connect")
             ProcessConnectMessage(eventArgs);
+        else if (eventName == "deactivate")
+            World::Get().GetRunner().Queue([] { World::Get().GetOverlayService().SetActive(false); });
+        else if (eventName == "startHosting")
+        {
+            const int port = eventArgs->GetInt(0);
+            const auto password = eventArgs->GetString(1).ToString();
+            const bool internet = eventArgs->GetBool(2);
+            if (port < 1 || port > 65535)
+                return false;
+            World::Get().GetRunner().Queue([port, password, internet] {
+                auto& helgen = World::Get().ctx().at<HelgenService>();
+                if (!helgen.PrepareConnection())
+                    return;
+                if (!World::Get().GetTransport().IsConnected())
+                    if (!World::Get().GetOverlayService().GetHostSession().Start(TiltedPhoques::GetPath() / "SkyrimTogetherServer.exe",
+                                                                              static_cast<uint16_t>(port), password, internet))
+                        helgen.Cancel();
+            });
+        }
+        else if (eventName == "stopHosting")
+            World::Get().GetRunner().Queue([] {
+                World::Get().GetOverlayService().GetHostSession().Stop();
+                World::Get().ctx().at<HelgenService>().Cancel();
+                World::Get().GetTransport().Close();
+            });
         else if (eventName == "disconnect")
             ProcessDisconnectMessage();
         else if (eventName == "revealPlayers")
@@ -52,13 +76,13 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
         else if (eventName == "setTime")
             ProcessSetTimeCommand(eventArgs);
         else if (eventName == "launchParty")
-            World::Get().GetPartyService().CreateParty();
+            World::Get().GetRunner().Queue([] { World::Get().GetPartyService().CreateParty(); });
         else if (eventName == "leaveParty")
-            World::Get().GetPartyService().LeaveParty();
+            World::Get().GetRunner().Queue([] { World::Get().GetPartyService().LeaveParty(); });
         else if (eventName == "createPartyInvite")
         {
             uint32_t aPlayerId = eventArgs->GetInt(0);
-            World::Get().GetPartyService().CreateInvite(aPlayerId);
+            World::Get().GetRunner().Queue([aPlayerId] { World::Get().GetPartyService().CreateInvite(aPlayerId); });
         }
         else if (eventName == "acceptPartyInvite")
         {
@@ -69,12 +93,12 @@ bool OverlayClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefR
         else if (eventName == "kickPartyMember")
         {
             uint32_t aPlayerId = eventArgs->GetInt(0);
-            World::Get().GetPartyService().KickPartyMember(aPlayerId);
+            World::Get().GetRunner().Queue([aPlayerId] { World::Get().GetPartyService().KickPartyMember(aPlayerId); });
         }
         else if (eventName == "changePartyLeader")
         {
             uint32_t aPlayerId = eventArgs->GetInt(0);
-            World::Get().GetPartyService().ChangePartyLeader(aPlayerId);
+            World::Get().GetRunner().Queue([aPlayerId] { World::Get().GetPartyService().ChangePartyLeader(aPlayerId); });
         }
         else if (eventName == "teleportToPlayer")
             ProcessTeleportMessage(eventArgs);
@@ -97,23 +121,32 @@ void OverlayClient::ProcessConnectMessage(CefRefPtr<CefListValue> aEventArgs)
         baseIp = "127.0.0.1";
     }
 
-    uint16_t port = aEventArgs->GetInt(1) ? aEventArgs->GetInt(1) : 10578;
-    World::Get().GetTransport().SetServerPassword(aEventArgs->GetString(2));
+    const int port = aEventArgs->GetInt(1);
+    if (port < 1 || port > 65535 || baseIp.empty() || baseIp.size() > 253 || baseIp.find_first_of(" \t\r\n/\\") != std::string::npos)
+        return;
+    const auto password = aEventArgs->GetString(2).ToString();
 
     std::string endpoint = baseIp + ":" + std::to_string(port);
 
-    World::Get().GetRunner().Queue([endpoint] { World::Get().GetTransport().Connect(endpoint); });
+    World::Get().GetRunner().Queue([endpoint, password] {
+        World::Get().GetTransport().SetServerPassword(password);
+        if (!World::Get().GetTransport().Connect(endpoint))
+            World::Get().GetTransport().OnDisconnected(Client::kLocalProblem);
+    });
 }
 
 void OverlayClient::ProcessDisconnectMessage()
 {
-    World::Get().GetRunner().Queue([]() { World::Get().GetTransport().Close(); });
+    World::Get().GetRunner().Queue([]() {
+        World::Get().ctx().at<HelgenService>().Cancel();
+        World::Get().GetTransport().Close();
+    });
 }
 
 void OverlayClient::ProcessRevealPlayersMessage()
 {
     SetUIVisible(false);
-    World::Get().GetMagicService().StartRevealingOtherPlayers();
+    World::Get().GetRunner().Queue([] { World::Get().GetMagicService().StartRevealingOtherPlayers(); });
 }
 
 void OverlayClient::ProcessChatMessage(CefRefPtr<CefListValue> aEventArgs)
@@ -125,18 +158,19 @@ void OverlayClient::ProcessChatMessage(CefRefPtr<CefListValue> aEventArgs)
         messageRequest.MessageType = static_cast<ChatMessageType>(aEventArgs->GetInt(0));
         messageRequest.ChatMessage = contents;
 
-        spdlog::info(L"Send chat message of type {}: '{}' ", messageRequest.MessageType, aEventArgs->GetString(1).ToWString());
-
-        m_transport.Send(messageRequest);
+        World::Get().GetRunner().Queue([messageRequest] { World::Get().GetTransport().Send(messageRequest); });
     }
 }
 
 void OverlayClient::ProcessSetTimeCommand(CefRefPtr<CefListValue> aEventArgs)
 {
-    const uint8_t hours = static_cast<uint8_t>(aEventArgs->GetInt(0));
-    const uint8_t minutes = static_cast<uint8_t>(aEventArgs->GetInt(1));
-    const uint32_t senderId = m_transport.GetLocalPlayerId();
-    World::Get().GetDispatcher().trigger(SetTimeCommandEvent(hours, minutes, senderId));
+    const int hours = aEventArgs->GetInt(0);
+    const int minutes = aEventArgs->GetInt(1);
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59)
+        return;
+    World::Get().GetRunner().Queue([hours, minutes] {
+        World::Get().GetDispatcher().trigger(SetTimeCommandEvent(hours, minutes, World::Get().GetTransport().GetLocalPlayerId()));
+    });
 }
 
 void OverlayClient::ProcessTeleportMessage(CefRefPtr<CefListValue> aEventArgs)
@@ -144,12 +178,12 @@ void OverlayClient::ProcessTeleportMessage(CefRefPtr<CefListValue> aEventArgs)
     TeleportRequest request{};
     request.PlayerId = aEventArgs->GetInt(0);
 
-    m_transport.Send(request);
+    World::Get().GetRunner().Queue([request] { World::Get().GetTransport().Send(request); });
 }
 
 void OverlayClient::ProcessToggleDebugUI()
 {
-    World::Get().GetDebugService().m_showDebugStuff = !World::Get().GetDebugService().m_showDebugStuff;
+    World::Get().GetRunner().Queue([] { World::Get().GetDebugService().m_showDebugStuff = !World::Get().GetDebugService().m_showDebugStuff; });
 }
 
 void OverlayClient::ProcessOpenPlayGuide()
@@ -159,11 +193,5 @@ void OverlayClient::ProcessOpenPlayGuide()
 
 void OverlayClient::SetUIVisible(bool aVisible) noexcept
 {
-    auto pRenderer = GetOverlayRenderHandler();
-    if (!pRenderer)
-        return;
-
-    TiltedPhoques::DInputHook::Get().SetEnabled(aVisible);
-    World::Get().GetOverlayService().SetActive(aVisible);
-    pRenderer->SetCursorVisible(aVisible);
+    World::Get().GetRunner().Queue([aVisible] { World::Get().GetOverlayService().SetActive(aVisible); });
 }

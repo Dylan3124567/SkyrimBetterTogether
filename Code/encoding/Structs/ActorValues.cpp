@@ -5,7 +5,7 @@ using TiltedPhoques::Serialization;
 
 bool ActorValues::operator==(const ActorValues& acRhs) const noexcept
 {
-    return ActorValuesList == acRhs.ActorValuesList;
+    return ActorValuesList == acRhs.ActorValuesList && ActorMaxValuesList == acRhs.ActorMaxValuesList;
 }
 
 bool ActorValues::operator!=(const ActorValues& acRhs) const noexcept
@@ -32,6 +32,8 @@ void ActorValues::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexce
 
 void ActorValues::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
 {
+    ActorValuesList.clear();
+    ActorMaxValuesList.clear();
     auto count = Serialization::ReadVarInt(aReader);
     for (int i = 0; i < count; i++)
     {

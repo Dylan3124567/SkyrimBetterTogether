@@ -1,8 +1,13 @@
 #include <Services/CalendarService.h>
+#include <Services/HelgenService.h>
 
 #include <Events/DisconnectedEvent.h>
 #include <Events/UpdateEvent.h>
 #include <Messages/ServerTimeSettings.h>
+#include <Messages/Sleep.h>
+#include <Interface/UI.h>
+#include <OverlayApp.hpp>
+#include <atomic>
 #include <World.h>
 
 #include <Forms/TESObjectCELL.h>
@@ -11,11 +16,102 @@
 
 constexpr float kTransitionSpeed = 5.f;
 
+namespace
+{
+std::atomic<uint32_t> s_sleepSession{}, s_sleepPermit{};
+std::atomic<bool> s_sleepActive{}, s_sleepRunning{}, s_sleepFinished{};
+thread_local bool s_nativeSleepTick = false;
+using StartSleep = void(PlayerCharacter*, uint32_t);
+using UpdateSleep = void(PlayerCharacter*);
+using StopSleep = void(PlayerCharacter*, bool);
+StartSleep* RealStartSleep;
+UpdateSleep* RealUpdateSleep;
+StopSleep* RealStopSleep;
+
+void SendSleep(RequestSleep aMessage)
+{
+    World::Get().GetRunner().Queue([aMessage]() {
+        if (World::Get().GetTransport().IsOnline() && aMessage.Session == s_sleepSession.load())
+            World::Get().GetTransport().Send(aMessage);
+    });
+}
+
+void HookStartSleep(PlayerCharacter* apPlayer, uint32_t aHours)
+{
+    if (World::Get().GetTransport().IsOnline() && apPlayer == PlayerCharacter::Get())
+    {
+        // This is the bed-only entry point. Ordinary waiting is not a sleep vote.
+        static VersionDbPtr<uint32_t> sleepStep(371317);
+        const uint32_t seconds = *sleepStep.Get();
+        if (!aHours || aHours > 24 || !seconds || seconds > 3600 || 3600 % seconds)
+            return;
+        s_sleepActive = true;
+        s_sleepRunning = false;
+        s_sleepFinished = false;
+        s_sleepPermit = 0;
+        RequestSleep request;
+        request.Session = ++s_sleepSession;
+        request.Hours = static_cast<uint8_t>(aHours);
+        request.Seconds = static_cast<uint16_t>(seconds);
+        request.State = RequestSleep::Begin;
+        SendSleep(request);
+    }
+    RealStartSleep(apPlayer, aHours);
+}
+
+void HookUpdateSleep(PlayerCharacter* apPlayer)
+{
+    if (!s_sleepActive || apPlayer != PlayerCharacter::Get())
+        return RealUpdateSleep(apPlayer);
+    const uint32_t step = s_sleepPermit.exchange(0);
+    if (!step || s_sleepFinished)
+        return;
+    // Only this native sleep increment may bypass the multiplayer clock lock.
+    // Keep native recovery, elapsed-day accounting and Papyrus sleep events intact.
+    auto* time = TimeData::Get();
+    time->rawDaysPassed = time->GameDaysPassed->f - time->GameHour->f / 24.f;
+    s_nativeSleepTick = true;
+    RealUpdateSleep(apPlayer);
+    s_nativeSleepTick = false;
+    RequestSleep request;
+    request.Session = s_sleepSession;
+    request.Step = step;
+    request.State = RequestSleep::Tick;
+    SendSleep(request);
+}
+
+void HookStopSleep(PlayerCharacter* apPlayer, bool aRecover)
+{
+    RealStopSleep(apPlayer, aRecover);
+    if (apPlayer != PlayerCharacter::Get() || !s_sleepActive)
+        return;
+    s_sleepFinished = true;
+    if (!s_nativeSleepTick)
+    {
+        RequestSleep request;
+        request.Session = s_sleepSession;
+        request.State = RequestSleep::Cancel;
+        SendSleep(request);
+    }
+}
+
+void EndSleep(bool aCompleted)
+{
+    s_sleepPermit = 0;
+    s_sleepRunning = false;
+    if (s_sleepActive && !s_sleepFinished.exchange(true))
+        if (auto* player = PlayerCharacter::Get())
+            RealStopSleep(player, aCompleted);
+    // Keep the tick gate until the native menu has closed; otherwise its final
+    // update could advance another chunk after we shortened a longer sleep.
+}
+}
+
 bool CalendarService::s_gameClockLocked = false;
 
 bool CalendarService::AllowGameTick() noexcept
 {
-    return !s_gameClockLocked;
+    return !s_gameClockLocked || s_nativeSleepTick;
 }
 
 CalendarService::CalendarService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport)
@@ -24,6 +120,7 @@ CalendarService::CalendarService(World& aWorld, entt::dispatcher& aDispatcher, T
     m_timeUpdateConnection = aDispatcher.sink<ServerTimeSettings>().connect<&CalendarService::OnTimeUpdate>(this);
     m_updateConnection = aDispatcher.sink<UpdateEvent>().connect<&CalendarService::HandleUpdate>(this);
     m_disconnectedConnection = aDispatcher.sink<DisconnectedEvent>().connect<&CalendarService::OnDisconnected>(this);
+    m_sleepConnection = aDispatcher.sink<NotifySleep>().connect<&CalendarService::OnSleep>(this);
 }
 
 void CalendarService::OnTimeUpdate(const ServerTimeSettings& acMessage) noexcept
@@ -49,6 +146,8 @@ void CalendarService::OnTimeUpdate(const ServerTimeSettings& acMessage) noexcept
 
 void CalendarService::OnDisconnected(const DisconnectedEvent&) noexcept
 {
+    EndSleep(false);
+    SleepStatus("");
     // signal a time transition
     m_fadeTimer = 0.f;
     ToggleGameClock(true);
@@ -83,6 +182,8 @@ void CalendarService::ToggleGameClock(bool aEnable)
 
 void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
 {
+    if (s_sleepActive && s_sleepFinished && !s_sleepRunning && UI::Get() && !UI::Get()->GetMenuOpen("Sleep/Wait Menu"))
+        s_sleepActive = false;
     if (s_gameClockLocked)
     {
         const auto updateDelta = static_cast<float>(aEvent.Delta);
@@ -100,7 +201,16 @@ void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
         const auto delta = now - m_lastTick;
         m_lastTick = now;
 
+        if (s_sleepRunning)
+            return; // Native sleep already updates GameDaysPassed; never count it twice.
+
         m_onlineTime.Update(delta);
+        // Keep the scripted intro's lighting while the creation menu and scene run.
+        if (m_world.ctx().at<HelgenService>().DeferActors())
+        {
+            m_fadeTimer = 0.f;
+            return;
+        }
         pGameTime->TimeScale->f = m_onlineTime.m_timeModel.TimeScale;
         pGameTime->GameDay->f = m_onlineTime.m_timeModel.Day;
         pGameTime->GameMonth->f = m_onlineTime.m_timeModel.Month;
@@ -117,3 +227,55 @@ void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
             pGameTime->GameHour->f = m_onlineTime.m_timeModel.Time;
     }
 }
+
+void CalendarService::SleepStatus(const String& aText) noexcept
+{
+    spdlog::info("Shared sleep: {}", aText);
+    auto args = CefListValue::Create();
+    args->SetString(0, aText.c_str());
+    m_world.GetOverlayService().GetOverlayApp()->ExecuteAsync("helgenStatus", args);
+}
+
+void CalendarService::OnSleep(const NotifySleep& aMessage) noexcept
+{
+    // A cancelled native menu may close before the server's cancellation reply.
+    // Still clear its waiting banner and accept the final clock for this session.
+    if (aMessage.Session != s_sleepSession.load())
+        return;
+    if (aMessage.State == NotifySleep::Waiting)
+    {
+        SleepStatus(fmt::format("Sleeping: {}/{} ready. Everyone must use a bed and choose Sleep. Cancel to get up.", aMessage.Ready, aMessage.Total).c_str());
+        return;
+    }
+    ServerTimeSettings time;
+    time.timeModel = aMessage.Time;
+    OnTimeUpdate(time);
+    m_lastTick = m_world.GetTick();
+    m_fadeTimer = kTransitionSpeed;
+    if (aMessage.State == NotifySleep::Advance && !s_sleepFinished)
+    {
+        if (!s_sleepRunning.exchange(true))
+            SleepStatus("");
+        s_sleepPermit = aMessage.Step;
+    }
+    else if (aMessage.State == NotifySleep::Finished || aMessage.State == NotifySleep::Cancelled)
+    {
+        EndSleep(aMessage.State == NotifySleep::Finished);
+        SleepStatus("");
+    }
+}
+
+static TiltedPhoques::Initializer s_sleepHooks([] {
+    // Source-only implementation authorised by the user. Installed 1.7.104
+    // disassembly confirms bed start, 900-second update and native stop paths.
+    // No IDA/Ghidra MCP verification; Survival effects still need runtime proof.
+    POINTER_SKYRIMSE(StartSleep, start, 40414);
+    POINTER_SKYRIMSE(UpdateSleep, update, 40485);
+    POINTER_SKYRIMSE(StopSleep, stop, 40417);
+    RealStartSleep = start.Get();
+    RealUpdateSleep = update.Get();
+    RealStopSleep = stop.Get();
+    TP_HOOK(&RealStartSleep, HookStartSleep);
+    TP_HOOK(&RealUpdateSleep, HookUpdateSleep);
+    TP_HOOK(&RealStopSleep, HookStopSleep);
+});

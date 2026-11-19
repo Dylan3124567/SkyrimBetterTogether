@@ -60,6 +60,7 @@ void Inventory::Entry::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexc
     ExtraEnchantId.Deserialize(aReader);
     ExtraEnchantCharge = Serialization::ReadVarInt(aReader) & 0xFFFF;
     uint64_t effectCount = Serialization::ReadVarInt(aReader);
+    EnchantData.Effects.clear();
     for (uint64_t i = 0; i < effectCount; i++)
     {
         EffectItem effect;
@@ -83,7 +84,7 @@ void Inventory::Entry::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexc
 
 bool Inventory::operator==(const Inventory& acRhs) const noexcept
 {
-    return Entries == acRhs.Entries;
+    return Entries == acRhs.Entries && CurrentMagicEquipment == acRhs.CurrentMagicEquipment;
 }
 
 bool Inventory::operator!=(const Inventory& acRhs) const noexcept
@@ -115,11 +116,12 @@ void Inventory::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
 void Inventory::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
 {
     uint32_t count = Serialization::ReadVarInt(aReader) & 0xFFFFFFFF;
+    Entries.clear();
     for (uint32_t i = 0; i < count; i++)
     {
         Entry entry;
         entry.Deserialize(aReader);
-        Entries.push_back(entry);
+        Entries.push_back(std::move(entry));
     }
 
     CurrentMagicEquipment.Deserialize(aReader);
@@ -127,7 +129,7 @@ void Inventory::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
 
 std::optional<Inventory::Entry> Inventory::GetEntryById(GameId& aItemId) const noexcept
 {
-    auto entry = std::find_if(Entries.begin(), Entries.end(), [aItemId](auto entry) { return entry.BaseId == aItemId; });
+    auto entry = std::find_if(Entries.begin(), Entries.end(), [aItemId](const auto& acEntry) { return acEntry.BaseId == aItemId; });
     if (entry == Entries.end())
         return std::nullopt;
 
@@ -136,17 +138,13 @@ std::optional<Inventory::Entry> Inventory::GetEntryById(GameId& aItemId) const n
 
 int32_t Inventory::GetEntryCountById(GameId& aItemId) const noexcept
 {
-    auto entry = GetEntryById(aItemId);
-    if (!entry)
-        return 0;
-
-    return entry->Count;
+    const auto entry = std::find_if(Entries.begin(), Entries.end(), [aItemId](const auto& acEntry) { return acEntry.BaseId == aItemId; });
+    return entry != Entries.end() ? entry->Count : 0;
 }
 
-// TODO: unit testing
 void Inventory::AddOrRemoveEntry(const Entry& acEntry) noexcept
 {
-    auto duplicate = std::find_if(Entries.begin(), Entries.end(), [acEntry](Entry& entry) { return entry.CanBeMerged(acEntry); });
+    auto duplicate = std::find_if(Entries.begin(), Entries.end(), [&acEntry](const Entry& entry) { return entry.CanBeMerged(acEntry); });
 
     if (duplicate != Entries.end())
     {
@@ -162,14 +160,8 @@ void Inventory::AddOrRemoveEntry(const Entry& acEntry) noexcept
 
 void Inventory::UpdateEquipment(const Inventory& acNewInventory) noexcept
 {
-    while (true)
-    {
-        auto wornEntry = std::find_if(Entries.begin(), Entries.end(), [](auto& aEntry) { return aEntry.IsWorn(); });
-        if (wornEntry == Entries.end())
-            break;
-
-        wornEntry->ExtraWorn = wornEntry->ExtraWornLeft = false;
-    }
+    for (auto& entry : Entries)
+        entry.ExtraWorn = entry.ExtraWornLeft = false;
 
     for (const auto& newEntry : acNewInventory.Entries)
     {

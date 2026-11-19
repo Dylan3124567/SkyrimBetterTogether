@@ -14,6 +14,35 @@ import { LoadingService } from './loading.service';
   providedIn: 'root',
 })
 export class ClientService implements OnDestroy {
+  public helgenStatus = new BehaviorSubject('');
+  public menuShortcut = new BehaviorSubject(false);
+  public hostStatus = new BehaviorSubject({ state: 'stopped', message: '', address: '', lanAddress: '', port: 10578 });
+  public hostPassword = '';
+  private joinWhenHostReady = false;
+  private createHostedParty = false;
+
+  public startHosting(port: number, password: string, internet: boolean): void {
+    if (this.connectionStateChange.value || this.isConnectionInProgressChange.value || !['stopped', 'error'].includes(this.hostStatus.value.state)) return;
+    this.hostPassword = password;
+    this.joinWhenHostReady = true;
+    this.hostStatus.next({ state: 'starting', message: '', address: '', lanAddress: '', port });
+    skyrimtogether.startHosting(port, password, internet);
+  }
+
+  public joinHostedGame(): void {
+    if (this.hostStatus.value.state !== 'ready' || this.connectionStateChange.value || this.isConnectionInProgressChange.value) return;
+    this.createHostedParty = true;
+    this.connect('127.0.0.1', this.hostStatus.value.port, this.hostPassword);
+  }
+
+  public stopHosting(): void {
+    this.joinWhenHostReady = false;
+    this.createHostedParty = false;
+    if (this._host === '127.0.0.1' && this._port === this.hostStatus.value.port) this.disconnect();
+    this.hostStatus.next({ ...this.hostStatus.value, state: 'stopping' });
+    skyrimtogether.stopHosting();
+  }
+
   /** Initialization done. */
   public initDone = new AsyncSubject<undefined>();
 
@@ -118,6 +147,16 @@ export class ClientService implements OnDestroy {
     private readonly translocoService: TranslocoService,
     private readonly chatService: ChatService,
   ) {
+    skyrimtogether.on('hostStatus', (state, message, address, lanAddress, port) => this.zone.run(() => {
+      this.hostStatus.next({ state, message, address, lanAddress, port });
+      if (state === 'ready' && this.joinWhenHostReady) {
+        this.joinWhenHostReady = false;
+        this.joinHostedGame();
+      }
+      if (state === 'error' || state === 'stopped') this.joinWhenHostReady = false;
+    }));
+    skyrimtogether.on('helgenStatus', message => this.zone.run(() => this.helgenStatus.next(message)));
+    skyrimtogether.on('menuShortcut', visible => this.zone.run(() => this.menuShortcut.next(visible)));
     skyrimtogether.on('init', this.onInit.bind(this));
     skyrimtogether.on('activate', this.onActivate.bind(this));
     skyrimtogether.on('deactivate', this.onDeactivate.bind(this));
@@ -161,6 +200,8 @@ export class ClientService implements OnDestroy {
    * Dispose.
    */
   public ngOnDestroy(): void {
+    skyrimtogether.off('hostStatus');
+    skyrimtogether.off('menuShortcut');
     skyrimtogether.off('init');
     skyrimtogether.off('activate');
     skyrimtogether.off('deactivate');
@@ -199,19 +240,22 @@ export class ClientService implements OnDestroy {
    * @param password Password or admin password
    */
   public connect(host: string, port: number, password = ''): void {
-    skyrimtogether.connect(host, port, password);
+    if (this.isConnectionInProgressChange.value || this.connectionStateChange.value) return;
     this.isConnectionInProgressChange.next(true);
     this._host = host;
     this._port = port;
     this._password = password;
+    skyrimtogether.connect(host, port, password);
   }
 
   /**
    * Disconnect from the server or cancel connection.
    */
   public disconnect(): void {
-    skyrimtogether.disconnect();
     this._remainingReconnectionAttempt = 0;
+    this.createHostedParty = false;
+    skyrimtogether.disconnect();
+    this.isConnectionInProgressChange.next(false);
   }
 
   /**
@@ -281,7 +325,7 @@ export class ClientService implements OnDestroy {
    * Reconnect
    */
   public reconnect(): void {
-    skyrimtogether.reconnect();
+    this.connect(this._host, this._port, this._password);
     this._remainingReconnectionAttempt = 0;
   }
 
@@ -354,6 +398,10 @@ export class ClientService implements OnDestroy {
       this._remainingReconnectionAttempt = environment.nbReconnectionAttempts;
       this.isConnectionInProgressChange.next(false);
       this.connectionStateChange.next(true);
+      if (this.createHostedParty) {
+        this.createHostedParty = false;
+        this.launchParty();
+      }
 
       this.chatService.pushSystemMessage('SERVICE.CLIENT.CONNECTED');
     });
