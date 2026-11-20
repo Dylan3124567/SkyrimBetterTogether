@@ -1,6 +1,6 @@
 <ng-container *ngIf="inGame$ | async">
   <!-- Lives for the whole game session so showing it is one class flip, with its font and frame already loaded. -->
-  <app-window border="fancy" class="multiplayer-shortcut" [class.shown]="menuShortcut$ | async">
+  <app-window #shortcut border="fancy" class="multiplayer-shortcut" [class.shown]="menuShortcut$ | async">
     <div class="multiplayer-shortcut-title">{{ 'COMPONENT.ROOT.MULTIPLAYER' | transloco }}</div>
     <div class="multiplayer-shortcut-entries">
       <ng-container *ngTemplateOutlet="menuButtons"></ng-container>

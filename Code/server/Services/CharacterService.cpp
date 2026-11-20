@@ -41,6 +41,10 @@
 #include <Messages/NotifySubtitle.h>
 #include <Messages/NotifyActorTeleport.h>
 
+#include <Services/ActorValueService.h>
+#include <Structs/DeathMemory.h>
+#include <Structs/QuestRole.h>
+
 #include <Setting.h>
 #include <cmath>
 namespace
@@ -49,8 +53,7 @@ Console::Setting bEnableXpSync{"Gameplay:bEnableXpSync", "Syncs combat XP within
 
 // Snapshots come every ~90 ms at worst, a client doesn't claim before its own wait of 5 seconds runs out either
 constexpr uint64_t cOwnerSilentTime = 3000;
-// iHoursToRespawnCell, the earliest a cell can bring its actors back
-constexpr int64_t cDeathRecordHours = 240;
+constexpr uint64_t cDialogueTransferInterval = 10000;
 
 // Good enough to tell days apart, months are short of 31 days only by a day or two
 int64_t GetGameHour(const CalendarService& acCalendar) noexcept
@@ -149,7 +152,7 @@ void CharacterService::Serialize(World& aRegistry, entt::entity aEntity, Charact
     }
 
     auto& animationComponent = aRegistry.get<AnimationComponent>(aEntity);
-    apSpawnRequest->ActionsToReplay = animationComponent.ActionsReplayCache.FormRefinedReplayChain();
+    apSpawnRequest->ActionsToReplay = animationComponent.ActionsReplayCache.FormRefinedReplayChain(pMovementComponent && pMovementComponent->IsHeldInPlace);
 }
 
 void CharacterService::OnUpdate(const UpdateEvent&) const noexcept
@@ -276,6 +279,37 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
         }
     }
 
+    // The same actor as one another party member runs, made by its game for the same quest alias: the requester's own one
+    // shows that actor (QuestRole)
+    if (isCustom && !isPlayer && !message.HelgenAliasId && !message.IsPlayerSummon && QuestRole::IsRole(message.RoleQuestId.BaseId, message.RoleAliasId, true))
+    {
+        const auto& requesterParty = acMessage.pPlayer->GetParty().JoinedPartyId;
+        const auto view = m_world.view<CharacterComponent, CellIdComponent, OwnerComponent>();
+        for (const auto entity : view)
+        {
+            const auto roleIt = m_questRoles.find(entity);
+            const Player* pOwner = view.get<OwnerComponent>(entity).GetOwner();
+            const auto& characterComponent = view.get<CharacterComponent>(entity);
+
+            const bool cSameRole = roleIt != m_questRoles.end() && roleIt->second.first == message.RoleQuestId && roleIt->second.second == message.RoleAliasId;
+            const bool cSharesParty = pOwner && requesterParty && pOwner->GetParty().JoinedPartyId == requesterParty;
+            const bool cInRange = view.get<CellIdComponent>(entity).IsInRange(acMessage.pPlayer->GetCellComponent(), characterComponent.IsDragon());
+            if (!QuestRole::IsSameSpawn(cSameRole, pOwner == acMessage.pPlayer, cSharesParty, cInRange, characterComponent.IsDead(), message.CurrentActorData.IsDead))
+                continue;
+
+            spdlog::info(
+                "Actor of alias {} of quest {:x}:{:x} from player {:X} is {:X}, which another party member runs", message.RoleAliasId, message.RoleQuestId.ModId, message.RoleQuestId.BaseId,
+                acMessage.pPlayer->GetId(), World::ToInteger(entity));
+
+            AssignCharacterResponse response{};
+            response.Cookie = message.Cookie;
+            response.Owner = false;
+            PopulateAssignmentResponse(entity, response);
+            acMessage.pPlayer->Send(response);
+            return;
+        }
+    }
+
     // This entity has no owner create it
     CreateCharacter(acMessage);
 }
@@ -381,6 +415,16 @@ void CharacterService::OnCharacterRemoveEvent(const CharacterRemoveEvent& acEven
     for (auto pPlayer : m_world.GetPlayerManager())
         pPlayer->Send(response);
 
+    // Entity ids are reused
+    m_questRoles.erase(*it);
+
+    // A player whose character is gone has none until the client assigns a new one; the id may soon name another entity
+    for (Player* pPlayer : m_world.GetPlayerManager())
+    {
+        if (pPlayer->GetCharacter() == *it)
+            pPlayer->ClearCharacter();
+    }
+
     m_world.destroy(*it);
     spdlog::debug("Character destroyed {:X}", acEvent.ServerId);
 }
@@ -412,6 +456,20 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
         !acMessage.pPlayer->GetCellComponent().IsInRange(cellIdComponent, characterComponent.IsDragon()))
     {
         return;
+    }
+
+    // Its AI is what makes an actor stop and face the player talking to it, so that player's client runs it. Only from
+    // another member of the owner's party, who could already have it as leader.
+    // Two members talking to the same actor would hand it back and forth, each hand-over resending its data: one per 10 s.
+    if (message.ForDialogue && pOwner && message.ExpectedOwnershipEpoch == ownerComponent.OwnershipEpoch &&
+        GameServer::Get()->GetTick() - ownerComponent.LastDialogueTransfer >= cDialogueTransferInterval)
+    {
+        const auto* pParty = m_world.GetPartyService().GetPlayerParty(acMessage.pPlayer);
+        if (pParty && std::find(pParty->Members.begin(), pParty->Members.end(), pOwner) != pParty->Members.end())
+        {
+            TransferOwnership(acMessage.pPlayer, cEntity, OwnershipTransferReason::Dialogue);
+            return;
+        }
     }
 
     // Any client around may take over an actor its owner stopped running, or left asleep while the actor woke up on that client.
@@ -476,6 +534,7 @@ void CharacterService::OnReferencesMoveRequest(const PacketEvent<ClientReference
         auto& movementComponent = view.get<MovementComponent>(*itor);
         auto& cellIdComponent = view.get<CellIdComponent>(*itor);
         const auto& characterComponent = view.get<CharacterComponent>(*itor);
+        const CellIdComponent cPreviousCell = cellIdComponent;
 
         movementComponent.Tick = message.Tick;
         movementComponent.Position = movement.Position;
@@ -485,9 +544,19 @@ void CharacterService::OnReferencesMoveRequest(const PacketEvent<ClientReference
         movementComponent.LastReceived = GameServer::Get()->GetTick();
         movementComponent.IsHeldInPlace = movement.IsHeldInPlace;
 
-        cellIdComponent.Cell = movement.CellId;
-        cellIdComponent.WorldSpaceId = movement.WorldSpaceId;
-        cellIdComponent.CenterCoords = GridCellCoords::CalculateGridCellCoords(movement.Position.x, movement.Position.y);
+        // The owner sends no cell while the actor has no parent cell it can name (mid-load): the actor is still where it was
+        if (movement.CellId != GameId{} || movement.WorldSpaceId != GameId{})
+        {
+            cellIdComponent.Cell = movement.CellId;
+            cellIdComponent.WorldSpaceId = movement.WorldSpaceId;
+            cellIdComponent.CenterCoords = GridCellCoords::CalculateGridCellCoords(movement.Position.x, movement.Position.y);
+        }
+
+        // Players are spawned and removed through their own cell requests, NPCs only ever were when a player moved. Exterior
+        // range follows the grid cell of the position, which can cross a grid edge in another snapshot than the cell id.
+        if (!characterComponent.IsPlayer() &&
+            (cPreviousCell.Cell != cellIdComponent.Cell || cPreviousCell.WorldSpaceId != cellIdComponent.WorldSpaceId || cPreviousCell.CenterCoords != cellIdComponent.CenterCoords))
+            NotifyRangeChange(entity, cPreviousCell, acMessage.pPlayer);
 
         for (auto pPlayer : m_world.GetPlayerManager())
         {
@@ -503,6 +572,42 @@ void CharacterService::OnReferencesMoveRequest(const PacketEvent<ClientReference
     // Sent right away, Nagle would hold every relay back by up to 5 ms waiting for more to share the packet with
     for (auto& [pPlayer, relay] : messages)
         pPlayer->Send(relay, TiltedPhoques::kUnreliableNoNagle);
+}
+
+void CharacterService::NotifyRangeChange(const entt::entity aEntity, const CellIdComponent& acPreviousCell, const Player* apOwner) const noexcept
+{
+    // An NPC its owner takes into another player's range was never shown there, that player's game has it wherever its own
+    // save left it: someone walking out of an interior wasn't seen outside. One that leaves the range stayed frozen there.
+    const auto& cellIdComponent = m_world.get<CellIdComponent>(aEntity);
+    const bool cIsDragon = m_world.get<CharacterComponent>(aEntity).IsDragon();
+
+    CharacterSpawnRequest spawnMessage;
+    bool isSpawnSerialized = false;
+
+    NotifyRemoveCharacter removeMessage;
+    removeMessage.ServerId = World::ToInteger(aEntity);
+
+    for (Player* pPlayer : m_world.GetPlayerManager())
+    {
+        if (pPlayer == apOwner)
+            continue;
+
+        const bool cWasInRange = acPreviousCell.IsInRange(pPlayer->GetCellComponent(), cIsDragon);
+        const bool cIsInRange = cellIdComponent.IsInRange(pPlayer->GetCellComponent(), cIsDragon);
+
+        if (cIsInRange && !cWasInRange)
+        {
+            if (!isSpawnSerialized)
+            {
+                Serialize(m_world, aEntity, &spawnMessage);
+                isSpawnSerialized = true;
+            }
+
+            pPlayer->Send(spawnMessage);
+        }
+        else if (cWasInRange && !cIsInRange)
+            pPlayer->Send(removeMessage);
+    }
 }
 
 void CharacterService::OnActionEventsRequest(const PacketEvent<RequestActionEvents>& acMessage) const noexcept
@@ -734,22 +839,29 @@ void CharacterService::CreateCharacter(const PacketEvent<AssignCharacterRequest>
     const auto gameId = message.ReferenceId;
     const auto baseId = message.FormId;
 
-    const auto cEntity = m_world.create();
     const auto isTemporary = gameId.ModId == std::numeric_limits<uint32_t>::max();
     const auto isPlayer = (gameId.ModId == 0 && gameId.BaseId == 0x14);
     const auto isCustom = isPlayer || isTemporary;
 
     // For player characters and temporary forms
-    if (!isCustom)
+    if (isCustom && baseId != GameId{} && !isTemporary)
     {
-        m_world.emplace<FormIdComponent>(cEntity, gameId.BaseId, gameId.ModId);
-    }
-    else if (baseId != GameId{} && !isTemporary)
-    {
-        m_world.destroy(cEntity);
         spdlog::warn("Unexpected NpcId, player {:x} might be forging packets", acMessage.pPlayer->GetConnectionId());
         return;
     }
+
+    // A player has one character. One left from an earlier assignment stays on every other client as a copy nobody moves,
+    // and each assignment adds another. Removed before anything is created, so nothing below holds on to a component it moves.
+    if (const auto oldCharacter = acMessage.pPlayer->GetCharacter(); isPlayer && oldCharacter && m_world.valid(*oldCharacter))
+    {
+        spdlog::warn("Removing character {:X} of player {:X}, the player was given a new one", World::ToInteger(*oldCharacter), acMessage.pPlayer->GetId());
+        m_world.GetDispatcher().trigger(CharacterRemoveEvent(World::ToInteger(*oldCharacter)));
+    }
+
+    const auto cEntity = m_world.create();
+
+    if (!isCustom)
+        m_world.emplace<FormIdComponent>(cEntity, gameId.BaseId, gameId.ModId);
 
     auto* const pServer = GameServer::Get();
 
@@ -764,6 +876,8 @@ void CharacterService::CreateCharacter(const PacketEvent<AssignCharacterRequest>
 
     auto& characterComponent = m_world.emplace<CharacterComponent>(cEntity);
     characterComponent.HelgenAliasId = message.HelgenAliasId;
+    if (isTemporary && !message.HelgenAliasId && QuestRole::IsRole(message.RoleQuestId.BaseId, message.RoleAliasId, true))
+        m_questRoles[cEntity] = {message.RoleQuestId, message.RoleAliasId};
     characterComponent.ChangeFlags = message.ChangeFlags;
     characterComponent.SaveBuffer = std::move(message.AppearanceBuffer);
     characterComponent.BaseId = FormIdComponent(message.FormId);
@@ -780,7 +894,9 @@ void CharacterService::CreateCharacter(const PacketEvent<AssignCharacterRequest>
     {
         if (const auto deathIt = m_deadActors.find(gameId); deathIt != m_deadActors.end())
         {
-            isDead = isDead || GetGameHour(m_world.GetCalendarService()) - deathIt->second < cDeathRecordHours;
+            // A player who was there when it died and has it alive brought it back since, the console's resurrect say
+            const bool cSawDeath = m_world.ctx().at<ActorValueService>().TakeWitness(gameId, *acMessage.pPlayer);
+            isDead = isDead || DeathMemory::KeepsDeath(GetGameHour(m_world.GetCalendarService()) - deathIt->second, cSawDeath);
             m_deadActors.erase(deathIt);
         }
     }
@@ -864,7 +980,8 @@ void CharacterService::PopulateAssignmentResponse(const entt::entity aEntity, As
         }
     }
 
-    if (const auto* pMovementComponent = m_world.try_get<MovementComponent>(aEntity))
+    const auto* pMovementComponent = m_world.try_get<MovementComponent>(aEntity);
+    if (pMovementComponent)
         aResponse.Position = pMovementComponent->Position;
 
     if (const auto* pCellIdComponent = m_world.try_get<CellIdComponent>(aEntity))
@@ -874,7 +991,7 @@ void CharacterService::PopulateAssignmentResponse(const entt::entity aEntity, As
     }
 
     if (auto* pAnimationComponent = m_world.try_get<AnimationComponent>(aEntity))
-        aResponse.ActionsToReplay = pAnimationComponent->ActionsReplayCache.FormRefinedReplayChain();
+        aResponse.ActionsToReplay = pAnimationComponent->ActionsReplayCache.FormRefinedReplayChain(pMovementComponent && pMovementComponent->IsHeldInPlace);
 }
 
 const char* CharacterService::GetOwnershipTransferReasonName(const OwnershipTransferReason aReason) noexcept
@@ -891,6 +1008,8 @@ const char* CharacterService::GetOwnershipTransferReasonName(const OwnershipTran
         return "owner relinquished control";
     case OwnershipTransferReason::OwnerUnavailable:
         return "owner became unavailable";
+    case OwnershipTransferReason::Dialogue:
+        return "dialogue with a party member";
     }
 
     return "unknown reason";
@@ -977,6 +1096,8 @@ bool CharacterService::TransferOwnership(Player* apPlayer, const entt::entity aE
 
     ownerComponent.SetOwner(apPlayer);
     ownerComponent.OwnershipEpoch = newEpoch;
+    if (aReason == OwnershipTransferReason::Dialogue)
+        ownerComponent.LastDialogueTransfer = GameServer::Get()->GetTick();
     if (aResetInvalidOwners)
         ownerComponent.InvalidOwners.clear();
 
@@ -1014,6 +1135,14 @@ void CharacterService::TransferToNextOwner(const entt::entity aEntity, const Own
     auto& ownerComponent = view.get<OwnerComponent>(*it);
     const auto& characterComponent = view.get<CharacterComponent>(*it);
     const auto& cellIdComponent = view.get<CellIdComponent>(*it);
+
+    // A player's character goes with its player. Handed to someone else it became an NPC copy of that player there.
+    if (characterComponent.IsPlayer())
+    {
+        spdlog::warn("Removing character {:X} after {}, it belongs to a player", World::ToInteger(aEntity), pReasonName);
+        m_world.GetDispatcher().trigger(CharacterRemoveEvent(World::ToInteger(aEntity)));
+        return;
+    }
 
     for (Player* pPlayer : m_world.GetPlayerManager())
     {

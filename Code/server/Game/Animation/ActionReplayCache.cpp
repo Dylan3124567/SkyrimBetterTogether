@@ -2,7 +2,7 @@
 #include <Game/Animation/AnimationEventLists.h>
 #include <optional>
 
-ActionReplayChain ActionReplayCache::FormRefinedReplayChain() noexcept
+ActionReplayChain ActionReplayCache::FormRefinedReplayChain(const bool aIsHeldInPlace) noexcept
 {
     const bool shouldResetAnimGraph = RefineReplayCache();
 
@@ -11,6 +11,9 @@ ActionReplayChain ActionReplayCache::FormRefinedReplayChain() noexcept
     chain.Actions = (shouldResetAnimGraph && !m_actions.empty())
         ? Vector<ActionEvent>{m_actions.begin() + 1, m_actions.end()} // Drop the exit action
         : m_actions;
+
+    if (!aIsHeldInPlace)
+        chain.DropFurnitureActions();
 
     return chain;
 }

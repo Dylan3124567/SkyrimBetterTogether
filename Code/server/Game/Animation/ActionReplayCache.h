@@ -18,7 +18,8 @@ public:
 
     static constexpr uint32_t kReplayCacheMaxSize = 32;
 
-    ActionReplayChain FormRefinedReplayChain() noexcept;
+    /// @param aIsHeldInPlace Whether the owner has the actor in furniture now, see ActionReplayChain::DropFurnitureActions
+    ActionReplayChain FormRefinedReplayChain(bool aIsHeldInPlace) noexcept;
 
     /// Appends actions to the replay cache
     void AppendAll(const Vector<ActionEvent>& acActions) noexcept;

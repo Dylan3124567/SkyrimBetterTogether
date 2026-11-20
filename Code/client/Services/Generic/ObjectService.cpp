@@ -25,6 +25,7 @@
 #include <Forms/BGSEncounterZone.h>
 #include <Forms/TESFaction.h>
 #include <Games/TES.h>
+#include <Services/PapyrusService.h>
 
 #include <inttypes.h>
 
@@ -240,6 +241,47 @@ void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessa
             else
                 pObject->SetInventory(objectData.CurrentInventory);
         }
+    }
+
+    for (const WorldObjectState& state : acMessage.States)
+        ApplyRememberedState(state);
+}
+
+void ObjectService::ApplyRememberedState(const WorldObjectState& acState) noexcept
+{
+    auto* pObject = Cast<TESObjectREFR>(TESForm::GetById(m_world.GetModSystem().GetGameId(acState.Id)));
+    if (!pObject || !pObject->baseForm || pObject->IsTemporary())
+        return;
+
+    const bool cIsDoor = pObject->baseForm->formType == FormType::Door;
+    if (!WorldObjectRules::CanApplyTo(cIsDoor, pObject->flags, pObject->extraData.Contains(ExtraDataType::Teleport)))
+        return;
+
+    // The lock first: the door may only open after it was unlocked.
+    if (acState.HasLock)
+    {
+        Lock* pLock = pObject->GetLock();
+        const bool cLocked = pLock && pLock->IsLocked();
+        if (cLocked != acState.Lock.IsLocked)
+        {
+            if (!pLock)
+                pLock = pObject->CreateLock();
+            if (pLock)
+            {
+                pLock->lockLevel = acState.Lock.LockLevel;
+                pLock->SetLock(acState.Lock.IsLocked);
+                pObject->LockChange();
+            }
+        }
+    }
+
+    if (WorldObjectRules::NeedsOpenChange(acState.OpenState, pObject->GetOpenState()))
+    {
+        // SetOpen moves the door without activating it, so no activation scripts run a second time.
+        using ObjectReference = TESObjectREFR;
+        PAPYRUS_FUNCTION(void, ObjectReference, SetOpen, bool);
+        s_pSetOpen(pObject, WorldObjectRules::IsOpen(acState.OpenState));
+        spdlog::info("Applied remembered open state {} to door {:X}", static_cast<int>(acState.OpenState), pObject->formID);
     }
 }
 

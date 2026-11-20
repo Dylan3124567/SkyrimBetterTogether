@@ -10,11 +10,15 @@
 #include <Services/HelgenService.h>
 #include <Services/ImguiService.h>
 #include <Services/OverlayService.h>
+#include <Services/PapyrusService.h>
 #include <Services/TransportService.h>
 
 #include <OverlayApp.hpp>
 
 #include <PlayerCharacter.h>
+#include <TESObjectREFR.h>
+#include <Forms/ImageSpaceModifierInstanceForm.h>
+#include <Forms/TESImageSpaceModifier.h>
 #include <AI/Movement/PlayerControls.h>
 #include <Forms/TESQuest.h>
 #include <Interface/UI.h>
@@ -46,8 +50,8 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
     // Game events:
     // Starts, stops and stages are sent from TESQuestStartStopEvent and TESQuestStageEvent, which fire while the quest
     // changes. Outside a party they only prompt the overlay.
-    // TESQuestStageItemDoneEvent fires once for each of a stage's log entries, after its fragment has run. That's too
-    // late to send on, but it tells when an applied held stage is done.
+    // TESQuestStageItemDoneEvent fires once for each of a stage's log entries whose conditions passed, after its fragment
+    // has run. That's too late to send on, but it tells when an applied member stage is done.
     // Scene events help diagnose held stages; phase completion also restores the local Helgen cuff-cutting controls.
     // OnUpdate explains why scene events can't trigger the release of held stages.
 
@@ -59,13 +63,23 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
     pEventList->sceneActionEvent.RegisterSink(this);
     pEventList->scenePhaseEvent.RegisterSink(this);
     pEventList->topicInfoEvent.RegisterSink(this);
+    pEventList->loadGameEvent.RegisterSink(this);
 }
 
-void QuestService::OnConnected(const ConnectedEvent&) noexcept
+void QuestService::ClearSession() noexcept
 {
     ++m_session;
     m_pendingUpdates.clear();
     m_heldStages.clear();
+    m_appliedStages.clear();
+    m_pendingStops.clear();
+    m_orderedUpdates.clear();
+    m_endingQuests.Entries.clear();
+}
+
+void QuestService::OnConnected(const ConnectedEvent&) noexcept
+{
+    ClearSession();
     // TODO: this should be followed with whatever the quest leader selected
     /*
     // deselect any active quests
@@ -80,13 +94,17 @@ void QuestService::OnConnected(const ConnectedEvent&) noexcept
 
 void QuestService::OnUpdate(const UpdateEvent& acEvent) noexcept
 {
-    if (m_pendingUpdates.empty() && m_heldStages.empty() && !m_world.GetPartyService().IsInParty())
+    if (m_pendingUpdates.empty() && m_heldStages.empty() && m_recoveries.empty() && m_crossFadeCheckIn < 0.0 && !m_world.GetPartyService().IsInParty())
         return;
 
     // Quest fragments can change controls, cameras and cells. Let local character creation/loading finish first.
+    // The journal reads the player's objectives without the lock their writer takes (RequestObjectivesData, 53171, walks
+    // PlayerCharacter+0x590 unlocked while 40510 locks +0x3E8 to grow it), counting on the game being paused while it's
+    // open. Members' updates would set stages under it, and their fragments objectives.
     UI* pUI = UI::Get();
     PlayerCharacter* pPlayer = PlayerCharacter::Get();
-    if (!pUI || !pPlayer || !pPlayer->parentCell || pUI->GetMenuOpen(BSFixedString("RaceSex Menu")) || pUI->GetMenuOpen(BSFixedString("Loading Menu")))
+    if (!pUI || !pPlayer || !pPlayer->parentCell || pUI->GetMenuOpen(BSFixedString("RaceSex Menu")) || pUI->GetMenuOpen(BSFixedString("Loading Menu")) ||
+        pUI->GetMenuOpen(BSFixedString("Journal Menu")))
         return;
 
     // A player can pull the first keep chain while Hadvar's activation package is running.
@@ -105,7 +123,8 @@ void QuestService::OnUpdate(const UpdateEvent& acEvent) noexcept
                 }
     }
 
-    if (m_pendingUpdates.empty() && m_heldStages.empty())
+    if (m_pendingUpdates.empty() && m_heldStages.empty() && m_appliedStages.empty() && m_pendingStops.empty() && m_recoveries.empty() &&
+        m_orderedUpdates.empty() && m_crossFadeCheckIn < 0.0 && m_endingQuests.Entries.empty())
         return;
 
     // Give each applied stage's scripts a frame before starting the next remote update.
@@ -123,8 +142,20 @@ void QuestService::OnUpdate(const UpdateEvent& acEvent) noexcept
             m_pendingUpdates.push_front(update); // Preserve branch selection before its cascading stages.
         else if (update.Stage >= 500 && formId == 0x3372B && helgen.DeferBridgeCollapse())
             m_pendingUpdates.push_back(update);
+        else if (WaitsForOwnSequence(update))
+            m_orderedUpdates.push_back(update);
         else
             ApplyQuestUpdate(update);
+    }
+
+    UpdatePendingStops(acEvent.Delta);
+    UpdateRecoveries(acEvent.Delta);
+    ReleaseOrderedUpdates(acEvent.Delta);
+    if (m_crossFadeCheckIn >= 0.0)
+    {
+        m_crossFadeCheckIn -= acEvent.Delta;
+        if (m_crossFadeCheckIn < 0.0)
+            RemoveLeftOverCrossFades();
     }
 
     // Checked every frame rather than on scene events: an action's done event fires before its fragment runs, and the
@@ -147,32 +178,46 @@ void QuestService::OnUpdate(const UpdateEvent& acEvent) noexcept
 
 void QuestService::OnDisconnected(const DisconnectedEvent&) noexcept
 {
-    ++m_session;
-    m_pendingUpdates.clear();
-    m_heldStages.clear();
+    ClearSession();
 }
 
 void QuestService::OnPartyLeft(const PartyLeftEvent&) noexcept
 {
-    ++m_session;
-    m_pendingUpdates.clear();
-    m_heldStages.clear();
+    ClearSession();
 }
 
 void QuestService::OnPartyJoined(const PartyJoinedEvent&) noexcept
 {
     // Do not send events queued before this party existed to its new members.
-    ++m_session;
-    m_pendingUpdates.clear();
-    m_heldStages.clear();
+    ClearSession();
 }
 
 BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent, const EventDispatcher<TESQuestStartStopEvent>*)
 {
-    if (!ScopedQuestOverride::IsOverriden())
+    // Whatever stopped it, a member or its own scripts
+    if (!apEvent->started)
+    {
+        for (const QuestRecovery::Rule& rule : QuestRecovery::kRules)
+        {
+            if (rule.Quest == apEvent->formId)
+                m_world.GetRunner().Queue([this, &rule] { StartRecovery(rule); });
+        }
+        for (const QuestRecovery::CrossFade& crossFade : QuestRecovery::kCrossFades)
+        {
+            if (crossFade.Sequence == apEvent->formId)
+                m_world.GetRunner().Queue([this] { m_crossFadeCheckIn = QuestRecovery::kCrossFadeDelay; });
+        }
+    }
+
+    // The story manager sends {formId, true, true} when a story event failed to start the quest (32483): nothing
+    // started. A stop's event doesn't say how the quest ended (25047 sends {formId, false, false}), its flags do.
+    if (!ScopedQuestOverride::IsOverriden() && !(apEvent->started && apEvent->failed))
     {
         if (TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(apEvent->formId)))
-            QueueQuestUpdate(apEvent->formId, pQuest->currentStage, apEvent->started ? RequestQuestUpdate::Started : RequestQuestUpdate::Stopped);
+        {
+            const uint8_t cStatus = apEvent->started ? static_cast<uint8_t>(RequestQuestUpdate::Started) : static_cast<uint8_t>(QuestSharing::StopStatus(pQuest->flags));
+            QueueQuestUpdate(apEvent->formId, pQuest->currentStage, cStatus);
+        }
     }
     return BSTEventResult::kOk;
 }
@@ -191,17 +236,28 @@ void QuestService::QueueQuestUpdate(uint32_t aFormId, uint16_t aStage, uint8_t a
     {
         if (session != m_session)
             return;
-        if (m_world.ctx().at<HelgenService>().LocalQuest(aFormId))
+        // Checked first: the stop event that comes for a quest ended for a member must always end its entry
+        if (m_endingQuests.Suppresses(aFormId, QuestSharing::IsStop(aStatus)))
+        {
+            spdlog::info("Not sending quest {:X} stage {} status {}: the game is ending it for a member's stop", aFormId, aStage, aStatus);
+            return;
+        }
+        if (m_world.ctx().at<HelgenService>().LocalQuest(aFormId) || IsRecovering(aFormId))
             return;
         if (!m_world.GetPartyService().IsInParty())
         {
-            if (aStatus != RequestQuestUpdate::Stopped)
+            if (!QuestSharing::IsStop(aStatus))
                 NotifyOverlayOfQuestUpdate(aFormId);
             return;
         }
 
         TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(aFormId));
         if (!pQuest || IsNonSyncableQuest(pQuest) || !QuestSharing::IsShared(static_cast<uint8_t>(pQuest->type)))
+            return;
+
+        // A stage this copy sets while a member's stop waits here belongs to the run that member ended, the server would
+        // take it for a new run and start the quest again everywhere
+        if (aStatus == RequestQuestUpdate::StageUpdate && m_pendingStops.find(aFormId) != m_pendingStops.end())
             return;
 
         RequestQuestUpdate update;
@@ -223,6 +279,9 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageItemDoneEvent* apEvent, 
         {
             if (session != m_session)
                 return;
+
+            if (auto applied = m_appliedStages.find(questFormId); applied != m_appliedStages.end())
+                applied.value().Done(stage);
 
             auto it = m_heldStages.find(questFormId);
             if (it == m_heldStages.end())
@@ -298,6 +357,21 @@ BSTEventResult QuestService::OnEvent(const TESScenePhaseEvent* apEvent, const Ev
     }
 
     spdlog::debug("Scene {:X} phase {} {}, actions:{}", apEvent->sceneFormId, apEvent->phaseIndex, apEvent->type == 0 ? "begin" : "end", actions);
+    return BSTEventResult::kOk;
+}
+
+BSTEventResult QuestService::OnEvent(const TESLoadGameEvent*, const EventDispatcher<TESLoadGameEvent>*)
+{
+    // The loaded world replaces whatever was being ended, and a save can hold a quest that stopped mid-sequence
+    m_world.GetRunner().Queue(
+        [this]
+        {
+            m_recoveries.clear();
+            for (const QuestRecovery::Rule& rule : QuestRecovery::kRules)
+                StartRecovery(rule);
+            // A save keeps the crossfade (upstream issue 835: black across restarts)
+            m_crossFadeCheckIn = QuestRecovery::kCrossFadeDelay;
+        });
     return BSTEventResult::kOk;
 }
 
@@ -434,11 +508,12 @@ static void ApplyHeldStages(TESQuest* apQuest, HeldStages& aHeld, size_t aCount)
     // In order, a later stage's scripts can rely on the earlier ones
     for (size_t i = 0; i < aCount; ++i)
     {
-        // A scene the fragments start only plays once they've run, and the next stage may be what it waits on. Each log
-        // entry reports when its fragment is done.
+        // A scene the fragments start only plays once they've run, and the next stage may be what it waits on. A log
+        // entry reports when its fragment is done, but one whose conditions fail never runs (TESQuestStageItem 25260),
+        // and a stage's variants usually exclude each other, so wait for the first.
         const uint16_t cStage = aHeld.Stages[i];
-        if (apQuest->ScriptSetStage(cStage))
-            aHeld.PendingItems.insert(aHeld.PendingItems.end(), apQuest->GetStageItemCount(cStage), cStage);
+        if (apQuest->ScriptSetStage(cStage) && apQuest->GetStageItemCount(cStage))
+            aHeld.PendingItems.push_back(cStage);
     }
 
     aHeld.Stages.erase(aHeld.Stages.begin(), aHeld.Stages.begin() + aCount);
@@ -575,6 +650,23 @@ void QuestService::ApplyQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
         return;
     }
 
+    // A later update means the member moved on after stopping the quest (a repeatable one starting over), so a stop still
+    // waiting here can't wait any longer
+    if (const auto stopIt = m_pendingStops.find(formId); stopIt != m_pendingStops.end())
+    {
+        const uint8_t cStatus = stopIt->second.Status;
+        m_pendingStops.erase(stopIt);
+        EndQuest(pQuest, cStatus);
+    }
+
+    // The game stops it a frame or more later: a restart or stage applied before then would mix into the run being
+    // stopped. Waits in front of the queue until the stop event, at most kEndingWait.
+    if (m_endingQuests.Contains(formId))
+    {
+        m_pendingUpdates.push_front(aUpdate);
+        return;
+    }
+
     if (aUpdate.Status == NotifyQuestUpdate::StageUpdate && pQuest->IsStageReached(aUpdate.Stage))
     {
         spdlog::info("Remote quest {:X} already reached stage {}, current stage: {}", formId, aUpdate.Stage, pQuest->currentStage);
@@ -583,19 +675,35 @@ void QuestService::ApplyQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
 
     // A member stage the leader's playing scene checks can push it past its own scripts (a phase ending before its lines
     // and scripts ran), so hold it, and the stages after it, until the scene gets there or reaches it itself.
+    const bool cIsStop = QuestSharing::IsStop(aUpdate.Status);
     const bool cIsLeaderStage = aUpdate.Status == NotifyQuestUpdate::StageUpdate && m_world.GetPartyService().IsLeader();
-    HeldStages* pHeld = cIsLeaderStage || aUpdate.Status == NotifyQuestUpdate::Stopped ? GetHeldStages(formId, pQuest) : nullptr;
+    HeldStages* pHeld = cIsLeaderStage || cIsStop ? GetHeldStages(formId, pQuest) : nullptr;
     if (cIsLeaderStage && (pHeld || IsCheckedByPlayingScene(pQuest, aUpdate.Stage)))
     {
         HoldStage(pQuest, aUpdate.Stage);
         return;
     }
 
-    // The member reached the held stages before stopping the quest, and once it's stopped here they're dropped
+    // The member reached the held stages before stopping the quest, and once it's stopped here they're dropped. The stop
+    // waits for their fragments, see PendingItems.
     if (pHeld && !pHeld->Stages.empty())
     {
         spdlog::info("Applying {} held member quest stages for {:X} before it stops", pHeld->Stages.size(), formId);
         ApplyHeldStages(pQuest, *pHeld, pHeld->Stages.size());
+    }
+
+    if (cIsStop)
+    {
+        // Nothing of the member's run to end in a quest that doesn't run here (it never started, or stopped itself)
+        if (pQuest->IsStopped())
+        {
+            spdlog::info("Remote quest {:X} ended, status: {}, it doesn't run here", formId, aUpdate.Status);
+            return;
+        }
+
+        m_pendingStops[formId] = QuestSharing::PendingStop{aUpdate.Status};
+        spdlog::info("Remote quest {:X} ended, status: {}, ending it here once its member stages' fragments have run", formId, aUpdate.Status);
+        return;
     }
 
     // The quest events fire synchronously while the stage is set, don't send them back
@@ -613,24 +721,239 @@ void QuestService::ApplyQuestUpdate(const NotifyQuestUpdate& aUpdate) noexcept
         if (!bResult)
             pQuest->EnsureQuestStarted(bResult, true);
         if (bResult && !pQuest->IsStageReached(aUpdate.Stage))
+        {
             bResult = pQuest->ScriptSetStage(aUpdate.Stage);
+            if (bResult)
+                TrackFragments(pQuest, aUpdate.Stage);
+        }
         pQuest->SetActive(true);
         spdlog::info("Remote quest started: {:X}, stage: {}", formId, aUpdate.Stage);
         break;
     }
     case NotifyQuestUpdate::StageUpdate:
         bResult = pQuest->ScriptSetStage(aUpdate.Stage);
+        if (bResult)
+            TrackFragments(pQuest, aUpdate.Stage);
         spdlog::info("Remote quest updated: {:X}, stage: {}", formId, aUpdate.Stage);
-        break;
-    case NotifyQuestUpdate::Stopped:
-        bResult = StopQuest(formId);
-        spdlog::info("Remote quest stopped: {:X}, stage: {}", formId, aUpdate.Stage);
         break;
     default: break;
     }
 
     if (!bResult)
         spdlog::error("Failed to update the client quest state, quest: {:X}, stage: {}, status: {}", formId, aUpdate.Stage, aUpdate.Status);
+}
+
+void QuestService::TrackFragments(TESQuest* apQuest, uint16_t aStage) noexcept
+{
+    // A stage without log entries has no fragments
+    if (apQuest->GetStageItemCount(aStage))
+        m_appliedStages[apQuest->formID].Add(aStage);
+}
+
+bool QuestService::AreFragmentsRunning(uint32_t aQuestFormId) const noexcept
+{
+    const auto applied = m_appliedStages.find(aQuestFormId);
+    if (applied != m_appliedStages.end() && applied->second.Running())
+        return true;
+
+    const auto held = m_heldStages.find(aQuestFormId);
+    return held != m_heldStages.end() && !held->second.PendingItems.empty();
+}
+
+void QuestService::UpdatePendingStops(double aDelta) noexcept
+{
+    m_endingQuests.Update(aDelta);
+
+    for (auto it = m_appliedStages.begin(); it != m_appliedStages.end();)
+    {
+        it.value().Age += aDelta;
+        if (it->second.Running())
+            ++it;
+        else
+            it = m_appliedStages.erase(it);
+    }
+
+    // Ending a quest runs game code, so collect first
+    Vector<uint32_t> ready;
+    for (auto it = m_pendingStops.begin(); it != m_pendingStops.end(); ++it)
+    {
+        if (it.value().Update(AreFragmentsRunning(it->first), aDelta))
+            ready.push_back(it->first);
+    }
+
+    for (uint32_t questFormId : ready)
+    {
+        const auto it = m_pendingStops.find(questFormId);
+        if (it == m_pendingStops.end())
+            continue;
+
+        const uint8_t cStatus = it->second.Status;
+        m_pendingStops.erase(it);
+        if (TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(questFormId)))
+            EndQuest(pQuest, cStatus);
+    }
+}
+
+// Ends the quest the way the member's ended, unless its own fragments did already: completed or failed as a log entry
+// does, then stopped as Papyrus Quest.Stop does. The game then stops its scenes and clears its aliases.
+void QuestService::EndQuest(TESQuest* apQuest, uint8_t aStatus) noexcept
+{
+    if (QuestSharing::NeedsOutcome(aStatus, apQuest->flags))
+        apQuest->SetEnded(aStatus == QuestSharing::kFailed);
+
+    // Enabled or already stopping, the game's stop event and shutdown stages are still to come, and are the member's
+    if (!apQuest->IsStopped())
+        m_endingQuests.Add(apQuest->formID);
+
+    const bool cWasRunning = apQuest->IsEnabled();
+    apQuest->Stop();
+    spdlog::info("Ended remote quest {:X}, status: {}, stage: {}{}", apQuest->formID, aStatus, apQuest->currentStage, cWasRunning ? "" : ", its own scripts had stopped it");
+}
+
+void QuestService::StartRecovery(const QuestRecovery::Rule& acRule) noexcept
+{
+    TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(acRule.Quest));
+    if (!pQuest || !QuestRecovery::Applies(pQuest->IsStopped(), pQuest->IsStageDone(acRule.SinceStage), pQuest->IsStageReached(acRule.UntilStage)))
+        return;
+
+    const TESObjectREFR* pDoor = Cast<TESObjectREFR>(TESForm::GetById(acRule.Door));
+    const auto* pLock = pDoor ? pDoor->GetLock() : nullptr;
+    const bool cUnlockDoor = pLock && pLock->IsLocked();
+
+    // A stopped controller's loop has ended (only it stops the controller), and setting a stage would start it again
+    TESQuest* pController = Cast<TESQuest>(TESForm::GetById(acRule.Controller));
+    const bool cEndSequence = pController && !pController->IsStopped() && pController->IsStageDone(acRule.ControllerStartStage) &&
+                              !pController->IsStageReached(acRule.ControllerStages.back());
+
+    if (!cUnlockDoor && !cEndSequence)
+        return;
+
+    m_recoveries[acRule.Quest] = Recovery{&acRule, cUnlockDoor, cEndSequence};
+    spdlog::info(
+        "Quest {:X} stopped at stage {} before stage {}, ending what it left running: door {:X} {}, controller {:X} {}", acRule.Quest, pQuest->currentStage,
+        acRule.UntilStage, acRule.Door, cUnlockDoor ? "to unlock" : "unlocked", acRule.Controller, cEndSequence ? "to end" : "not running");
+}
+
+void QuestService::UpdateRecoveries(double aDelta) noexcept
+{
+    Vector<uint32_t> finished;
+    for (auto it = m_recoveries.begin(); it != m_recoveries.end(); ++it)
+    {
+        Recovery& recovery = it.value();
+        const QuestRecovery::Rule& rule = *recovery.pRule;
+
+        if (recovery.UnlockDoor)
+        {
+            recovery.UnlockDoor = false;
+            if (TESObjectREFR* pDoor = Cast<TESObjectREFR>(TESForm::GetById(rule.Door)))
+            {
+                // What the stage's fragment does, Lock(false, false): Papyrus ObjectReference.Lock (native 56198) unlocks
+                // through GetLock 20223, Lock::SetLock 12401 and LockChange 19512, as ObjectService does for members
+                using ObjectReference = TESObjectREFR;
+                PAPYRUS_FUNCTION(void, ObjectReference, Lock, bool, bool);
+                s_pLock(pDoor, false, false);
+                spdlog::info("Unlocked {:X}, quest {:X} stopped before unlocking it", rule.Door, rule.Quest);
+            }
+        }
+
+        TESQuest* pController = recovery.EndSequence ? Cast<TESQuest>(TESForm::GetById(rule.Controller)) : nullptr;
+        if (!pController || recovery.Steps.Finished())
+        {
+            finished.push_back(it->first);
+            continue;
+        }
+
+        const auto cStage = recovery.Steps.Update(rule, aDelta, pController->IsStopped(), [pController](uint16_t aStage) { return pController->IsStageReached(aStage); });
+        if (cStage)
+        {
+            pController->ScriptSetStage(*cStage);
+            spdlog::info("Set stage {} of {:X}, quest {:X} stopped before it would", *cStage, rule.Controller, rule.Quest);
+        }
+    }
+
+    for (uint32_t questFormId : finished)
+        m_recoveries.erase(questFormId);
+}
+
+bool QuestService::IsRecovering(uint32_t aControllerFormId) const noexcept
+{
+    for (const auto& [_, recovery] : m_recoveries)
+    {
+        if (recovery.EndSequence && recovery.pRule->Controller == aControllerFormId)
+            return true;
+    }
+
+    return false;
+}
+
+bool QuestService::MustWaitForOwnSequence(const NotifyQuestUpdate& acUpdate) noexcept
+{
+    const uint32_t cFormId = m_world.GetModSystem().GetGameId(acUpdate.Id);
+    for (const QuestRecovery::StageOrder& order : QuestRecovery::kStageOrders)
+    {
+        if (order.Quest != cFormId)
+            continue;
+
+        const TESQuest* pSetBy = Cast<TESQuest>(TESForm::GetById(order.SetBy));
+        const bool cSetByRunning = pSetBy && !pSetBy->IsStopped();
+        // The next run of the sequence gets its own wait
+        if (!cSetByRunning)
+            m_orderWaited = 0.0;
+
+        if (QuestRecovery::MustWait(order, cFormId, acUpdate.Stage, cSetByRunning, m_orderWaited))
+            return true;
+    }
+
+    return false;
+}
+
+// Updates of a quest keep their order: once one waits, the later ones wait behind it
+bool QuestService::WaitsForOwnSequence(const NotifyQuestUpdate& acUpdate) noexcept
+{
+    const bool cQuestWaits = std::any_of(m_orderedUpdates.begin(), m_orderedUpdates.end(), [&acUpdate](const NotifyQuestUpdate& acWaiting) { return acWaiting.Id == acUpdate.Id; });
+    if (!cQuestWaits && !MustWaitForOwnSequence(acUpdate))
+        return false;
+
+    spdlog::info("Member quest update {:X} stage {} waits for this client's own sequence to set it", acUpdate.Id.LogFormat(), acUpdate.Stage);
+    return true;
+}
+
+void QuestService::ReleaseOrderedUpdates(double aDelta) noexcept
+{
+    if (m_orderedUpdates.empty())
+        return;
+
+    m_orderWaited += aDelta;
+    const double cWaited = m_orderWaited;
+    if (MustWaitForOwnSequence(m_orderedUpdates.front()))
+        return;
+
+    // Back in front of the queue, in order. A stage the sequence set itself is already reached by then.
+    spdlog::info("Releasing {} member quest updates that waited {:.0f} s for this client's own sequence", m_orderedUpdates.size(), cWaited);
+    m_pendingUpdates.insert(m_pendingUpdates.begin(), m_orderedUpdates.begin(), m_orderedUpdates.end());
+    m_orderedUpdates.clear();
+}
+
+void QuestService::RemoveLeftOverCrossFades() noexcept
+{
+    // ApplyCrossFade (18575, Papyrus native 55937) keeps its instance at 400901 until RemoveCrossFade (18577, native
+    // 55949) fades it out over the given seconds and clears it. The instance's modifier is at +0x28 (built by 18565).
+    POINTER_SKYRIMSE(ImageSpaceModifierInstanceForm*, s_crossFade, 400901);
+    using TRemoveCrossFade = void(float);
+    POINTER_SKYRIMSE(TRemoveCrossFade, s_removeCrossFade, 18577);
+
+    for (const QuestRecovery::CrossFade& crossFade : QuestRecovery::kCrossFades)
+    {
+        TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(crossFade.Quest));
+        const TESQuest* pSequence = Cast<TESQuest>(TESForm::GetById(crossFade.Sequence));
+        const ImageSpaceModifierInstanceForm* pCurrent = *s_crossFade.Get();
+        const bool cApplied = pCurrent && pCurrent->pMod && pCurrent->pMod->formID == crossFade.Modifier;
+        if (!pQuest || !QuestRecovery::IsLeftOver(pQuest->IsStageDone(crossFade.Stage), pSequence && !pSequence->IsStopped(), cApplied))
+            continue;
+
+        s_removeCrossFade.Get()(1.f);
+        spdlog::info("Removed crossfade {:X}: quest {:X} reached stage {} that replaces it before {:X} applied it", crossFade.Modifier, crossFade.Quest, crossFade.Stage, crossFade.Sequence);
+    }
 }
 
 void QuestService::NotifyOverlayOfQuestUpdate(uint32_t aFormId) noexcept
@@ -652,19 +975,6 @@ void QuestService::NotifyOverlayOfQuestUpdate(uint32_t aFormId) noexcept
         return;
 
     m_world.GetOverlayService().GetOverlayApp()->ExecuteAsync("questUpdated");
-}
-
-bool QuestService::StopQuest(uint32_t aformId)
-{
-    TESQuest* pQuest = Cast<TESQuest>(TESForm::GetById(aformId));
-    if (pQuest)
-    {
-        pQuest->SetActive(false);
-        pQuest->SetStopped();
-        return true;
-    }
-
-    return false;
 }
 
 static constexpr std::array kNonSyncableQuestIds = std::to_array<uint32_t>({

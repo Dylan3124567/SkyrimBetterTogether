@@ -24,6 +24,7 @@ export class PlayerListService implements OnDestroy {
   private partyInviteReceivedSubscription: Subscription;
 
   private isConnect = false;
+  private readonly inviteExpiries = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(
     private readonly clientService: ClientService,
@@ -182,6 +183,20 @@ export class PlayerListService implements OnDestroy {
       this.updatePlayerList();
 
       this.clientService.createPartyInvite(inviteeId);
+
+      // The server drops an unanswered invite after 60 seconds (PartyService), so the player can be invited again
+      clearTimeout(this.inviteExpiries.get(inviteeId));
+      this.inviteExpiries.set(
+        inviteeId,
+        setTimeout(() => {
+          this.inviteExpiries.delete(inviteeId);
+          const player = this.getPlayerById(inviteeId);
+          if (player && !player.isInLocalParty) {
+            player.hasBeenInvited = false;
+            this.updatePlayerList();
+          }
+        }, 60000),
+      );
     }
   }
 

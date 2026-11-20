@@ -95,6 +95,21 @@ static constexpr const char* kAllowList[] = {
     //"MapMenu", // MapMenu is disabled till we find a proper fix for first person.
 };
 
+// Unpaused elsewhere: the lock menu once its models load, the journal while a manual save waits.
+static constexpr const char* kAlsoUnpaused[] = {"Lockpicking Menu", "Journal Menu"};
+
+bool UI::IsUnpausedMenuOpen() const
+{
+    // Paused, they don't matter: player controls don't run while the game is paused.
+    for (const char* name : kAllowList)
+        if (GetMenuOpen(BSFixedString(name)))
+            return true;
+    for (const char* name : kAlsoUnpaused)
+        if (GetMenuOpen(BSFixedString(name)))
+            return true;
+    return false;
+}
+
 static void* (*UI_AddToActiveQueue)(UI*, IMenu*, void*);
 
 static void (*RealInitializeLockModels)(IMenu*);

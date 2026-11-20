@@ -17,11 +17,14 @@ struct RequestQuestUpdate final : ClientMessage
 
     bool operator==(const RequestQuestUpdate& acRhs) const noexcept { return GetOpcode() == acRhs.GetOpcode() && Id == acRhs.Id && Stage == acRhs.Stage && Status == acRhs.Status && ClientQuestType == acRhs.ClientQuestType; }
 
+    // Same values as QuestSharing::Status. A stop says how the quest ended.
     enum StatusCode : uint8_t
     {
         StageUpdate,
         Started,
-        Stopped
+        Stopped,
+        Completed,
+        Failed
     };
 
     GameId Id;

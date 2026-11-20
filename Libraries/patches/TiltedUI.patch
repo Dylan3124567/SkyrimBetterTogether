@@ -30,10 +30,10 @@ index 2521df2..f5c4618 100644
          bool m_isCursorVisible{ false };
          uint16_t m_cursorX{ 0 };
 diff --git a/Code/ui/src/OverlayApp.cpp b/Code/ui/src/OverlayApp.cpp
-index dfb1916..295a232 100644
+index dfb1916..a59ef8b 100644
 --- a/Code/ui/src/OverlayApp.cpp
 +++ b/Code/ui/src/OverlayApp.cpp
-@@ -1,180 +1,179 @@
+@@ -1,180 +1,197 @@
 -#include <OverlayApp.hpp>
 -#include <iostream>
 -#include <TiltedCore/Filesystem.hpp>
@@ -241,13 +241,12 @@ index dfb1916..295a232 100644
 +        settings.multi_threaded_message_loop = true;
 +        settings.windowless_rendering_enabled = true;
 +
-+        // TODO(cosideci): properly check debug mode for releasedbg
-+//#ifdef DEBUG
 +        settings.log_severity = LOGSEVERITY_VERBOSE;
-+        settings.remote_debugging_port = 8384;
-+//#else
-+        //settings.log_severity = LOGSEVERITY_VERBOSE;
-+//#endif
++        // DevTools let any program on this PC script the overlay and the game calls it exposes, so they are only on when a
++        // developer asks for them with STR_UI_DEBUG=1
++        wchar_t debug[2]{};
++        if (GetEnvironmentVariableW(L"STR_UI_DEBUG", debug, 2) == 1 && debug[0] == L'1')
++            settings.remote_debugging_port = 8384;
 +
 +        // Only the first instance will use real CEF cache, extra instances' caches go in
 +        // %TEMP% (see `root_cache_path` docs)
@@ -390,11 +389,30 @@ index dfb1916..295a232 100644
 +        }
 +
 +        // A lockfile does not exist until CEF starts, so simultaneous launches can share a slot.
-+        return std::filesystem::temp_directory_path() / L"tiltedui_cef_cache" / std::to_wstring(GetCurrentProcessId());
++        const auto cRoot = std::filesystem::temp_directory_path() / L"tiltedui_cef_cache";
++
++        // Caches of extra instances that have exited are never used again; without this %TEMP% grows with every launch
++        std::error_code error;
++        for (std::filesystem::directory_iterator it(cRoot, error), end; !error && it != end; it.increment(error))
++        {
++            const DWORD cPid = wcstoul(it->path().filename().c_str(), nullptr, 10);
++            if (cPid == 0 || cPid == GetCurrentProcessId())
++                continue;
++
++            if (const HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, cPid))
++                CloseHandle(hProcess);
++            else if (GetLastError() == ERROR_INVALID_PARAMETER)
++            {
++                std::error_code removeError;
++                std::filesystem::remove_all(it->path(), removeError);
++            }
++        }
++
++        return cRoot / std::to_wstring(GetCurrentProcessId());
 +    }
 +}
 diff --git a/Code/ui/src/OverlayRenderHandlerD3D11.cpp b/Code/ui/src/OverlayRenderHandlerD3D11.cpp
-index e69f71c..e4b0c8a 100644
+index e69f71c..c23159c 100644
 --- a/Code/ui/src/OverlayRenderHandlerD3D11.cpp
 +++ b/Code/ui/src/OverlayRenderHandlerD3D11.cpp
 @@ -7,6 +7,8 @@
@@ -406,7 +424,29 @@ index e69f71c..e4b0c8a 100644
  #include <OverlayClient.hpp>
  #include <OverlayRenderHandlerD3D11.hpp>
  
-@@ -56,7 +58,24 @@ namespace TiltedPhoques
+@@ -25,11 +27,11 @@ namespace TiltedPhoques
+     void OverlayRenderHandlerD3D11::Render()
+     {
+         // We need contexts first
+-        if (!m_pImmediateContext || !m_pContext)
++        if (!m_pImmediateContext || !m_pContext || !m_pSpriteBatch)
+         {
+             Create();
+ 
+-            if (!m_pImmediateContext || !m_pContext)
++            if (!m_pImmediateContext || !m_pContext || !m_pSpriteBatch)
+                 return;
+         }
+ 
+@@ -49,6 +51,7 @@ namespace TiltedPhoques
+         GetRenderTargetSize();
+ 
+         if (IsVisible())
++        try
+         {
+             m_pSpriteBatch->Begin(DirectX::SpriteSortMode_Deferred, m_pStates->NonPremultiplied());
+ 
+@@ -56,7 +59,24 @@ namespace TiltedPhoques
                  std::unique_lock<std::mutex> _(m_textureLock);
  
                  if (m_pTextureView)
@@ -432,3 +472,47 @@ index e69f71c..e4b0c8a 100644
              }
  
              if (IsCursorVisible() && m_pCursorTexture)
+@@ -66,6 +86,13 @@ namespace TiltedPhoques
+ 
+             m_pSpriteBatch->End();
+         }
++        catch (const std::exception&)
++        {
++            // DirectXTK throws when a D3D call fails, e.g. on a lost device, and this runs under the game's noexcept
++            // render callbacks where an exception is std::terminate (issue 843). Skip the overlay; Create() retries next frame.
++            m_pSpriteBatch.reset();
++            m_pStates.reset();
++        }
+     }
+ 
+     void OverlayRenderHandlerD3D11::Reset()
+@@ -93,11 +120,25 @@ namespace TiltedPhoques
+ 
+         GetRenderTargetSize();
+ 
+-        if (FAILED(m_pDevice->CreateDeferredContext(0, m_pContext.ReleaseAndGetAddressOf())))
+-            return;
++        {
++            // OnPaint uses the deferred context on a CEF thread, and Render() comes back here after a D3D failure
++            std::unique_lock _(m_textureLock);
++            if (FAILED(m_pDevice->CreateDeferredContext(0, m_pContext.ReleaseAndGetAddressOf())))
++                return;
++        }
+ 
+-        m_pSpriteBatch = std::make_unique<DirectX::SpriteBatch>(m_pImmediateContext.Get());
+-        m_pStates = std::make_unique<DirectX::CommonStates>(m_pDevice.Get());
++        try
++        {
++            m_pSpriteBatch = std::make_unique<DirectX::SpriteBatch>(m_pImmediateContext.Get());
++            m_pStates = std::make_unique<DirectX::CommonStates>(m_pDevice.Get());
++        }
++        catch (const std::exception&)
++        {
++            // Called from noexcept code, see Render()
++            m_pSpriteBatch.reset();
++            m_pStates.reset();
++            return;
++        }
+ 
+         if (FAILED(DirectX::CreateWICTextureFromFile(m_pDevice.Get(), m_pParent->GetCursorPathPNG().c_str(), nullptr, m_pCursorTexture.ReleaseAndGetAddressOf())))
+         {

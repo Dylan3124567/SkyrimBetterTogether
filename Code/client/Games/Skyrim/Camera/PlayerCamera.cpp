@@ -67,8 +67,36 @@ void TP_MAKE_THISCALL(HookUpdatePlayerCamera, PlayerCamera)
         return;
     TiltedPhoques::ThisCall(RealUpdatePlayerCamera, apThis);
 }
+
+struct InputEvent;
+TP_THIS_FUNCTION(TCameraCanProcess, bool, void, InputEvent*);
+TCameraCanProcess* RealThirdPersonCanProcess = nullptr;
+TCameraCanProcess* RealFirstPersonCanProcess = nullptr;
+
+// These take the zoom and POV events: the wheel and the view key (checked in 1.7.104, both compare the event against
+// UserEvents' togglePOV and zoom names). Vanilla pauses the game for the menus the fork keeps running, so the camera
+// never sees input there; here the wheel scrolling the Favorites list also zoomed, and left first person.
+// Third person's handler also serves the horse, dragon and bleedout cameras.
+bool TP_MAKE_THISCALL(HookThirdPersonCanProcess, void, InputEvent* apEvent)
+{
+    return TiltedPhoques::ThisCall(RealThirdPersonCanProcess, apThis, apEvent) && !UI::Get()->IsUnpausedMenuOpen();
+}
+
+bool TP_MAKE_THISCALL(HookFirstPersonCanProcess, void, InputEvent* apEvent)
+{
+    return TiltedPhoques::ThisCall(RealFirstPersonCanProcess, apThis, apEvent) && !UI::Get()->IsUnpausedMenuOpen();
+}
+
 static TiltedPhoques::Initializer s_creationCameraHook([] {
     POINTER_SKYRIMSE(TUpdatePlayerCamera, update, 50784);
     RealUpdatePlayerCamera = update.Get();
     TP_HOOK(&RealUpdatePlayerCamera, HookUpdatePlayerCamera);
+
+    // PlayerInputHandler::CanProcess of ThirdPersonState and FirstPersonState, vtable slot 1 at offset 0x20
+    POINTER_SKYRIMSE(TCameraCanProcess, thirdPersonCanProcess, 50905);
+    POINTER_SKYRIMSE(TCameraCanProcess, firstPersonCanProcess, 50729);
+    RealThirdPersonCanProcess = thirdPersonCanProcess.Get();
+    RealFirstPersonCanProcess = firstPersonCanProcess.Get();
+    TP_HOOK(&RealThirdPersonCanProcess, HookThirdPersonCanProcess);
+    TP_HOOK(&RealFirstPersonCanProcess, HookFirstPersonCanProcess);
 });

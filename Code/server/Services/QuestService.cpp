@@ -18,7 +18,7 @@ QuestService::QuestService(World& aWorld, entt::dispatcher& aDispatcher)
 void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessage) noexcept
 {
     const auto& message = acMessage.Packet;
-    if (message.Status != RequestQuestUpdate::Started && message.Status != RequestQuestUpdate::StageUpdate && message.Status != RequestQuestUpdate::Stopped)
+    if (!QuestSharing::IsValid(message.Status))
         return;
 
     auto* pPlayer = acMessage.pPlayer;
@@ -39,9 +39,9 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
         return;
 
     // The player's own quest log, kept up to date for their character data
-    if (message.Status == RequestQuestUpdate::Stopped)
+    if (QuestSharing::IsStop(message.Status))
     {
-        spdlog::debug("Stopped quest: {:X}, stage: {}", message.Id.LogFormat(), message.Stage);
+        spdlog::debug("Stopped quest: {:X}, stage: {}, status: {}", message.Id.LogFormat(), message.Stage, message.Status);
 
         if (questIt != entries.end())
             entries.erase(questIt);
@@ -66,7 +66,8 @@ void QuestService::OnQuestChanges(const PacketEvent<RequestQuestUpdate>& acMessa
         return;
 
     // Party members' scripts often reach the same start, stage or stop on their own, only relay it once. The relayed
-    // status is the reported one: a start stays a start even if this player had the quest before, so it starts elsewhere.
+    // status is the reported one: a start stays a start even if this player had the quest before, so it starts elsewhere,
+    // and a stop keeps how the quest ended here, so it ends the same way elsewhere.
     if (!pParty->QuestRuns[message.Id].Relay(message.Status, message.Stage))
     {
         spdlog::debug("Dropped duplicate quest update from player {}, quest: {:X}, stage: {}, status: {}", pPlayer->GetId(), message.Id.LogFormat(), message.Stage, message.Status);

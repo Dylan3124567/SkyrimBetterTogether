@@ -62,6 +62,9 @@
 #include <Systems/DropRules.h>
 #include <Systems/RespawnFlow.h>
 #include <Systems/SyncRules.h>
+#include <Systems/NpcSyncRules.h>
+#include <Systems/CombatRules.h>
+#include <Services/ActorValueService.h>
 
 namespace
 {
@@ -382,6 +385,22 @@ Actor* Actor::GetCombatTarget() const noexcept
 {
     PAPYRUS_FUNCTION(Actor*, Actor, GetCombatTarget);
     return s_pGetCombatTarget(this);
+}
+
+TESObjectREFR* Actor::GetOccupiedFurniture() const noexcept
+{
+    if (!currentProcess)
+        return nullptr;
+
+    // AIProcess::GetOccupiedFurniture, the IsCurrentFurnitureRef condition reads it: the middle high process data's
+    // furniture handle at 0x208, the null handle without that data
+    TP_THIS_FUNCTION(TGetOccupiedFurniture, BSPointerHandle<TESObjectREFR>*, AIProcess, BSPointerHandle<TESObjectREFR>*);
+    POINTER_SKYRIMSE(TGetOccupiedFurniture, s_getOccupiedFurniture, 39916);
+
+    BSPointerHandle<TESObjectREFR> handle{};
+    TiltedPhoques::ThisCall(s_getOccupiedFurniture, currentProcess, &handle);
+
+    return handle ? TESObjectREFR::GetByHandle(handle.handle.iBits) : nullptr;
 }
 
 // TODO: this is a really hacky solution.
@@ -783,29 +802,52 @@ void Actor::SetActorValues(const ActorValues& acActorValues) noexcept
 
 void Actor::SetFactions(const Factions& acFactions) noexcept
 {
+    // How the actor stands with this client's player stays this client's own, see NpcSyncRules::IsPlayerRelationshipFaction.
+    // The rank in effect is the change if there is one, -1 meaning removed, otherwise the base's.
+    Vector<std::pair<const TESFaction*, int8_t>> ownRanks;
+    const auto keepOwnRank = [&ownRanks](const TESFaction* apFaction, const int8_t aRank)
+    {
+        if (!apFaction || !NpcSyncRules::IsPlayerRelationshipFaction(apFaction->formID))
+            return;
+
+        const auto it = std::find_if(ownRanks.begin(), ownRanks.end(), [apFaction](const auto& acEntry) { return acEntry.first == apFaction; });
+        if (it != ownRanks.end())
+            it->second = aRank;
+        else
+            ownRanks.emplace_back(apFaction, aRank);
+    };
+
+    if (const auto* pNpc = Cast<TESNPC>(baseForm))
+    {
+        for (const auto& faction : pNpc->actorData.factions)
+            keepOwnRank(faction.faction, faction.rank);
+    }
+
+    if (const auto* pChanges = Cast<ExtraFactionChanges>(extraData.GetByType(ExtraDataType::Faction)))
+    {
+        for (const auto& change : pChanges->entries)
+            keepOwnRank(change.faction, change.rank);
+    }
+
     RemoveFromAllFactions();
 
     auto& modSystem = World::Get().GetModSystem();
 
-    for (auto& entry : acFactions.NpcFactions)
+    const auto applyRank = [this, &modSystem](const Faction& acEntry)
     {
-        auto pForm = GetById(modSystem.GetGameId(entry.Id));
-        auto pFaction = Cast<TESFaction>(pForm);
-        if (pFaction)
-        {
-            SetFactionRank(pFaction, entry.Rank);
-        }
-    }
+        const auto* pFaction = Cast<TESFaction>(GetById(modSystem.GetGameId(acEntry.Id)));
+        if (pFaction && !NpcSyncRules::IsPlayerRelationshipFaction(pFaction->formID))
+            SetFactionRank(pFaction, acEntry.Rank);
+    };
 
-    for (auto& entry : acFactions.ExtraFactions)
-    {
-        auto pForm = GetById(modSystem.GetGameId(entry.Id));
-        auto pFaction = Cast<TESFaction>(pForm);
-        if (pFaction)
-        {
-            SetFactionRank(pFaction, entry.Rank);
-        }
-    }
+    for (const auto& entry : acFactions.NpcFactions)
+        applyRank(entry);
+
+    for (const auto& entry : acFactions.ExtraFactions)
+        applyRank(entry);
+
+    for (const auto& [pFaction, rank] : ownRanks)
+        SetFactionRank(pFaction, rank);
 }
 
 void Actor::SetFactionRank(const TESFaction* apFaction, int8_t aRank) noexcept
@@ -875,6 +917,56 @@ bool Actor::IsDragon() const noexcept
     return BehaviorVar::IsDragon(pExtension->GraphDescriptorHash);
 }
 
+// Actor::UpdateEssentialFlags (37227): flags2 bits 18 and 19, essential and protected, from the base (a leveled actor's
+// original base) and the actor's aliases. The game only runs it in the actor's update and at the start of KillImpl.
+static void UpdateLifeFlags(Actor* apActor) noexcept
+{
+    TP_THIS_FUNCTION(TUpdateEssentialFlags, void, Actor);
+    POINTER_SKYRIMSE(TUpdateEssentialFlags, s_updateEssentialFlags, 37227);
+    TiltedPhoques::ThisCall(s_updateEssentialFlags, apActor);
+}
+
+bool Actor::CanBeKilledBy(Actor* apAttacker) noexcept
+{
+    // An alias that came or went since the last update, as a brawl's essential opponent, counts already
+    UpdateLifeFlags(this);
+
+    TP_THIS_FUNCTION(TCanBeKilledBy, bool, Actor, Actor*);
+    POINTER_SKYRIMSE(TCanBeKilledBy, s_canBeKilledBy, 37229);
+    return TiltedPhoques::ThisCall(s_canBeKilledBy, this, apAttacker);
+}
+
+// Set while the sync brings an actor back, HookResurrect tells those apart from a revival on this client
+static thread_local bool s_syncedResurrect = false;
+
+// ACBS flags of TESActorBaseData::actorBaseFlags
+constexpr uint32_t cBaseEssential = 1u << 1;
+constexpr uint32_t cBaseProtected = 1u << 11;
+
+/**
+ * KillImpl starts by working out essential and protected again (Actor::UpdateEssentialFlags, 37227: flags2 bits 18 and 19
+ * from the base, a leveled actor's original base, and the actor's aliases), before CanBeKilledBy decides between death and
+ * a knock down. The base gets the flags for the one call. An alias of this client still has its say.
+ */
+template <class T> static void WithBaseLifeFlags(Actor* apActor, const uint32_t aSet, const uint32_t aClear, const T& acCall) noexcept
+{
+    const auto* pLeveled = static_cast<ExtraLeveledCreature*>(apActor->extraData.GetByType(ExtraDataType::LeveledCreature));
+    TESActorBase* pBase = pLeveled && pLeveled->originalBase ? pLeveled->originalBase : Cast<TESNPC>(apActor->baseForm);
+    if (!pBase)
+    {
+        acCall();
+        return;
+    }
+
+    const uint32_t cSaved = pBase->actorData.actorBaseFlags;
+    pBase->actorData.actorBaseFlags = (cSaved | aSet) & ~aClear;
+
+    acCall();
+
+    pBase->actorData.actorBaseFlags = cSaved;
+    UpdateLifeFlags(apActor);
+}
+
 void Actor::Kill(bool aForceDeathAction) noexcept
 {
     // Never kill players
@@ -882,20 +974,90 @@ void Actor::Kill(bool aForceDeathAction) noexcept
     if (pExtension->IsPlayer())
         return;
 
+    // A death another client had: knocked down here instead for being essential or protected in this game, the actor stayed
+    // down for good. The killer comes with that death (CharacterService::KillWhenReady), OnDeath scripts check it.
+    Actor* pKiller = aForceDeathAction ? Cast<Actor>(TESObjectREFR::GetByHandle(killerHandle)) : nullptr;
+
     // The body drops through a death action, which remote actors have refused. That's fine when the owner's action
     // replays too, a copy of an actor that died before this client got there would stay on its feet instead.
     g_forceAnimation = aForceDeathAction;
 
-    // TODO: these args are kind of bogus of course
-    KillImpl(nullptr, 100.f, true, true);
+    WithBaseLifeFlags(this, 0, aForceDeathAction ? cBaseEssential | cBaseProtected : 0, [this, pKiller]() { KillImpl(pKiller, 100.f, true, true); });
 
     g_forceAnimation = false;
+}
 
-    // Papyrus kill will not go through if it is queued by a kill move
-    /*
-    PAPYRUS_FUNCTION(void, Actor, Kill, void*);
-    s_pKill(this, NULL);
-    */
+void Actor::KillByPlayer(Actor* apPlayer) noexcept
+{
+    if (GetExtension()->IsPlayer())
+        return;
+
+    // CanBeKilledBy only lets this client's player through protected, the other client's player is an NPC here
+    if (apPlayer)
+        killerHandle = apPlayer->GetHandle().handle.iBits;
+
+    WithBaseLifeFlags(this, 0, cBaseProtected, [this, apPlayer]() { KillImpl(apPlayer, 100.f, true, true); });
+}
+
+static void SetLifeState(Actor* apActor, CombatRules::LifeState aState) noexcept
+{
+    TP_THIS_FUNCTION(TSetLifeState, void, Actor, uint32_t);
+    POINTER_SKYRIMSE(TSetLifeState, s_setLifeState, 37612);
+    TiltedPhoques::ThisCall(s_setLifeState, apActor, static_cast<uint32_t>(aState));
+}
+
+void Actor::KnockDown() noexcept
+{
+    if (GetExtension()->IsPlayer() || IsDead())
+        return;
+
+    // Replayed actions write the owner's life state into a copy without the game ever putting it down, so its scripts
+    // never heard of it (OnEnterBleedout). Up again first, it goes down through the game.
+    if (actorState.IsBleedingOut())
+        actorState.flags1 &= ~ActorState::kLifeStateMask;
+
+    // A copy refuses its own bleedout action otherwise. The owner's goes out to the copies as usual.
+    g_forceAnimation = GetExtension()->IsRemote();
+
+    // An essential actor at zero health: KillImpl sees CanBeKilledBy refuse and knocks it down (life state 7)
+    WithBaseLifeFlags(this, cBaseEssential, 0, [this]() { KillImpl(nullptr, 0.f, true, false); });
+
+    g_forceAnimation = false;
+}
+
+void Actor::StandUp(float aHealth) noexcept
+{
+    if (!actorState.IsBleedingOut())
+        return;
+
+    g_forceAnimation = GetExtension()->IsRemote();
+
+    // A rise in health is what gets the game's downed actors up (health callbacks 38492 and 38633), so it starts below
+    const float cHealth = GetActorValue(ActorValueInfo::kHealth);
+    ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, std::min(cHealth, 0.f));
+    ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, std::isfinite(aHealth) ? std::max(aHealth, 1.f) : std::max(cHealth, 1.f));
+
+    // A bleedout with no recovery of its own (SetNoBleedoutRecovery) or a higher threshold still follows its owner
+    if (actorState.IsBleedingOut())
+        SetLifeState(this, CombatRules::kAlive);
+
+    g_forceAnimation = false;
+}
+
+void Actor::Revive() noexcept
+{
+    const bool cIsRemote = GetExtension()->IsRemote();
+
+    s_syncedResurrect = true;
+    // A copy refuses its own actions otherwise, getting off the ground among them
+    g_forceAnimation = cIsRemote;
+    Resurrect(false);
+    g_forceAnimation = false;
+    s_syncedResurrect = false;
+
+    // A copy's AI runs on its owner's client
+    if (!cIsRemote)
+        EvaluatePackage();
 }
 
 void Actor::Reset() noexcept
@@ -915,7 +1077,18 @@ bool Actor::PlayIdle(TESIdleForm* apIdle) noexcept
 
 void Actor::Respawn() noexcept
 {
+    // Every caller brings back a copy its owner has alive. Reset sent it to its editor location and reloaded its 3D, which
+    // dropped it out of the high process: discovery released it and it ran its own AI. A copy comes back where it lies.
+    if (GetExtension()->IsRemote())
+    {
+        Revive();
+        return;
+    }
+
+    s_syncedResurrect = true;
     Resurrect(false);
+    s_syncedResurrect = false;
+
     Reset();
 }
 
@@ -1091,6 +1264,51 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
     }
 }
 
+// Actor vfunc 0x104, which every health loss goes through (38468, from hits, magic and ForceActorValue alike). At zero health
+// it queues the death that KillImpl turns into a knock down for an essential actor.
+TP_THIS_FUNCTION(THandleHealthDamage, void, Actor, Actor* apAttacker, float aDamage);
+static THandleHealthDamage* RealHandleHealthDamage = nullptr;
+
+void TP_MAKE_THISCALL(HookHandleHealthDamage, Actor, Actor* apAttacker, float aDamage)
+{
+    // A copy's life follows its owner (CombatRules). On its own health, which misses what the owner's game restores, and with
+    // this client's essential flags it died where its owner's actor only went down, and never got up.
+    const auto* pExtension = apThis->GetExtension();
+    if (!CombatRules::ReactsToHealth(pExtension->IsRemote(), pExtension->IsPlayer()))
+        return;
+
+    TiltedPhoques::ThisCall(RealHandleHealthDamage, apThis, apAttacker, aDamage);
+}
+
+TP_THIS_FUNCTION(TResurrect, void, Actor, bool aResetInventory);
+static TResurrect* RealResurrect = nullptr;
+
+void TP_MAKE_THISCALL(HookResurrect, Actor, bool aResetInventory)
+{
+    const bool cWasDead = apThis->IsDead();
+
+    TiltedPhoques::ThisCall(RealResurrect, apThis, aResetInventory);
+
+    // The console's resurrect or a script on this client brought back a copy its owner still has dead. Papyrus runs this on its
+    // own thread, the request goes out from the main one.
+    const auto* pExtension = apThis->GetExtension();
+    if (cWasDead && !s_syncedResurrect && pExtension->IsRemote() && !pExtension->IsPlayer() && !apThis->IsDead())
+        World::Get().GetRunner().Queue([cFormId = apThis->formID]() { World::Get().ctx().at<ActorValueService>().OnLocalRevival(cFormId); });
+}
+
+static TiltedPhoques::Initializer s_deathHooks(
+    []()
+    {
+        POINTER_SKYRIMSE(THandleHealthDamage, s_handleHealthDamage, 38606);
+        POINTER_SKYRIMSE(TResurrect, s_resurrect, 37321);
+
+        RealHandleHealthDamage = s_handleHealthDamage.Get();
+        RealResurrect = s_resurrect.Get();
+
+        TP_HOOK(&RealHandleHealthDamage, HookHandleHealthDamage);
+        TP_HOOK(&RealResurrect, HookResurrect);
+    });
+
 TP_THIS_FUNCTION(TApplyActorEffect, void, ActiveEffect, Actor* apTarget, float aEffectValue, unsigned int unk1);
 static TApplyActorEffect* RealApplyActorEffect = nullptr;
 
@@ -1116,26 +1334,6 @@ void TP_MAKE_THISCALL(HookApplyActorEffect, ActiveEffect, Actor* apTarget, float
     }
 
     return TiltedPhoques::ThisCall(RealApplyActorEffect, apThis, apTarget, aEffectValue, unk1);
-}
-
-TP_THIS_FUNCTION(TRegenAttributes, void*, Actor, int aId, float regenValue);
-static TRegenAttributes* RealRegenAttributes = nullptr;
-
-void* TP_MAKE_THISCALL(HookRegenAttributes, Actor, int aId, float aRegenValue)
-{
-    if (aId != ActorValueInfo::kHealth)
-    {
-        return TiltedPhoques::ThisCall(RealRegenAttributes, apThis, aId, aRegenValue);
-    }
-
-    const auto* pExTarget = apThis->GetExtension();
-    if (pExTarget->IsRemote())
-    {
-        return 0;
-    }
-
-    World::Get().GetRunner().Trigger(HealthChangeEvent(apThis->formID, aRegenValue));
-    return TiltedPhoques::ThisCall(RealRegenAttributes, apThis, aId, aRegenValue);
 }
 
 void TP_MAKE_THISCALL(HookAddInventoryItem, Actor, TESBoundObject* apItem, ExtraDataList* apExtraData, int32_t aCount, TESObjectREFR* apOldOwner)
@@ -1281,6 +1479,17 @@ void Actor::ReleaseFromFurniture(bool aEvaluateAi) noexcept
 
     if (actorState.IsRestrained())
         s_pSetRestrained(this, false);
+
+    // Furniture the actor really occupies is let go of the way MoveTo, Disable and ForceState do it: the engine's quick
+    // exit (38697 with true) sets the sit state back, plays the furniture's exit action and clears the handle. Clearing the
+    // state alone left the furniture held, and the AI kept treating the actor as seated so it never got up.
+    if (GetOccupiedFurniture())
+    {
+        TP_THIS_FUNCTION(TStopInteractingQuick, void, Actor, bool aQuick);
+        POINTER_SKYRIMSE(TStopInteractingQuick, s_stopInteractingQuick, 38697);
+
+        TiltedPhoques::ThisCall(s_stopInteractingQuick, this, true);
+    }
 
     actorState.ClearFurnitureState();
 
@@ -1453,7 +1662,6 @@ static TiltedPhoques::Initializer s_actorHooks(
         POINTER_SKYRIMSE(TSpawnActorInWorld, s_SpawnActorInWorld, 19742);
         POINTER_SKYRIMSE(TDamageActor, s_damageActor, 37335);
         POINTER_SKYRIMSE(TApplyActorEffect, s_applyActorEffect, 35086);
-        POINTER_SKYRIMSE(TRegenAttributes, s_regenAttributes, 37448);
         POINTER_SKYRIMSE(TAddInventoryItem, s_addInventoryItem, 37525);
         POINTER_SKYRIMSE(TPickUpObject, s_pickUpObject, 37521);
         POINTER_SKYRIMSE(TDropObject, s_dropObject, 40454);
@@ -1475,7 +1683,6 @@ static TiltedPhoques::Initializer s_actorHooks(
         RealSpawnActorInWorld = s_SpawnActorInWorld.Get();
         RealDamageActor = s_damageActor.Get();
         RealApplyActorEffect = s_applyActorEffect.Get();
-        RealRegenAttributes = s_regenAttributes.Get();
         RealAddInventoryItem = s_addInventoryItem.Get();
         RealPickUpObject = s_pickUpObject.Get();
         RealDropObject = s_dropObject.Get();
@@ -1496,7 +1703,6 @@ static TiltedPhoques::Initializer s_actorHooks(
         TP_HOOK(&RealSpawnActorInWorld, HookSpawnActorInWorld);
         TP_HOOK(&RealDamageActor, HookDamageActor);
         TP_HOOK(&RealApplyActorEffect, HookApplyActorEffect);
-        TP_HOOK(&RealRegenAttributes, HookRegenAttributes);
         TP_HOOK(&RealAddInventoryItem, HookAddInventoryItem);
         TP_HOOK(&RealPickUpObject, HookPickUpObject);
         TP_HOOK(&RealDropObject, HookDropObject);

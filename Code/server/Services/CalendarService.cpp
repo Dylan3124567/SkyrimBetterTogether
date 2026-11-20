@@ -9,6 +9,7 @@
 
 #include <Messages/ServerTimeSettings.h>
 #include <Messages/Sleep.h>
+#include <Structs/TimeSyncRules.h>
 
 #include "Game/Player.h"
 
@@ -39,6 +40,13 @@ void CalendarService::OnUpdate(const UpdateEvent&) noexcept
     if (m_sleep.Step)
         return; // Native sleep steps, acknowledged by every client, own this clock temporarily.
     m_dateTime.Update(delta);
+
+    // Clients advance their copy of this clock on their own and drift from it, so it is resent now and then.
+    if (now >= m_nextResync && m_sleep.Players.empty() && TimeSyncRules::CanResyncAt(m_dateTime.m_timeModel.Time))
+    {
+        m_nextResync = now + TimeSyncRules::kResyncIntervalMs;
+        SendTimeResync();
+    }
 }
 
 void CalendarService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept

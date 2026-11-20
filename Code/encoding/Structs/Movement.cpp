@@ -5,7 +5,7 @@ using TiltedPhoques::Serialization;
 
 bool Movement::operator==(const Movement& acRhs) const noexcept
 {
-    return OwnershipEpoch == acRhs.OwnershipEpoch && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && IsHeldInPlace == acRhs.IsHeldInPlace;
+    return OwnershipEpoch == acRhs.OwnershipEpoch && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && Variables == acRhs.Variables && Direction == acRhs.Direction && IsHeldInPlace == acRhs.IsHeldInPlace && FurnitureId == acRhs.FurnitureId;
 }
 
 bool Movement::operator!=(const Movement& acRhs) const noexcept
@@ -23,6 +23,8 @@ void Movement::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
     Variables.GenerateDiff(AnimationVariables{}, aWriter);
     aWriter.WriteBits(*reinterpret_cast<const uint32_t*>(&Direction), 32);
     Serialization::WriteBool(aWriter, IsHeldInPlace);
+    if (IsHeldInPlace)
+        FurnitureId.Serialize(aWriter);
 }
 
 void Movement::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
@@ -40,4 +42,7 @@ void Movement::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
     uint32_t tmp32 = tmp & 0xFFFFFFFF;
     Direction = *reinterpret_cast<float*>(&tmp32);
     IsHeldInPlace = Serialization::ReadBool(aReader);
+    FurnitureId = {};
+    if (IsHeldInPlace)
+        FurnitureId.Deserialize(aReader);
 }

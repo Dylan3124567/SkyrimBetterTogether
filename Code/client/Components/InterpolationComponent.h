@@ -35,6 +35,19 @@ struct InterpolationComponent
     // Latest word from the owner, and when this copy started disagreeing with it, see SyncRules::ShouldReleaseFurniture
     bool OwnerHoldsInPlace{false};
     double HeldMismatchStart{-1.0};
+    // Whether a snapshot from the current owner has arrived, the fields about the owner mean nothing before
+    bool HasOwnerState{false};
+    // The owner has the actor in furniture that is missing or disabled here, see SyncRules::ShouldPlaySeatingAction
+    bool OwnerFurnitureMissing{false};
+    // That furniture as a local form id when it is here, 0 otherwise
+    uint32_t OwnerFurniture{};
+    // Where the owner has the actor as local form ids: the world space outside, the cell inside, both 0 when this client
+    // doesn't have it
+    uint32_t OwnerWorldSpace{};
+    uint32_t OwnerCell{};
+    double LastSpaceMove{-1e9};
+
+    bool IsOwnerInFurnitureHere() const noexcept { return OwnerHoldsInPlace && !OwnerFurnitureMissing; }
     // See SyncRules::ShouldLeaveFurniture
     bool MayBeInFurniture{true};
     double OwnerOutOfFurnitureSince{-1.0};

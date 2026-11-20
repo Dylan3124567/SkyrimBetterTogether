@@ -39,6 +39,11 @@ public:
 
     TP_NOCOPYMOVE(ActorValueService);
 
+    /**
+     * @brief Asks for an actor this client only has a copy of to come back for everyone, after something here revived it.
+     */
+    void OnLocalRevival(uint32_t aFormId) noexcept;
+
 private:
     enum ValueType : uint8_t
     {
@@ -50,6 +55,7 @@ private:
      * @brief Creates actor values components for new local components.
      */
     void OnLocalComponentAdded(entt::registry& aRegistry, entt::entity aEntity) noexcept;
+    void OnLocalComponentRemoved(entt::registry& aRegistry, entt::entity aEntity) noexcept;
     /**
      * @brief Clears actor values components on disconnect.
      */
@@ -79,7 +85,7 @@ private:
     /**
      * @brief Receives health value changes and applies them locally.
      */
-    void OnHealthChangeBroadcast(const NotifyHealthChangeBroadcast& acMessage) const noexcept;
+    void OnHealthChangeBroadcast(const NotifyHealthChangeBroadcast& acMessage) noexcept;
     /**
      * @brief Receives death state changes and applies them locally.
      */
@@ -100,9 +106,17 @@ private:
      */
     void RunSmallHealthUpdates() noexcept;
     /**
-     * @brief Checks and broadcasts death state changes.
+     * @brief Checks and broadcasts death and bleedout state changes.
      */
     void RunDeathStateUpdates() noexcept;
+    /**
+     * @brief Undoes what the co-op brawl deaths left behind, see CombatRules: debtors of TG01 and brawls with a dead opponent.
+     */
+    void RunBrawlRepairs() noexcept;
+    /**
+     * @brief Brings back an actor this client runs after a party member revived it.
+     */
+    bool ReviveOwnActor(const NotifyDeathStateChange& acMessage) const noexcept;
 
     /**
      * @brief Checks and broadcasts actor values.
@@ -120,4 +134,18 @@ private:
 
     //! @brief Server ids and collected health changes.
     Map<uint32_t, float> m_smallHealthChanges;
+    //! @brief Local actors last reported as down (bleeding out).
+    Set<entt::entity> m_downActors;
+    //! @brief Form ids of local actors down from a relayed blow that only knocks down, see CombatRules::IgnoresRelayedBlow.
+    Set<uint32_t> m_knockedOut;
+
+    struct DeadDebtor
+    {
+        std::chrono::steady_clock::time_point Since;
+        bool KilledByPlayer{};
+    };
+    //! @brief TG01 debtors seen dead, by form id, see CombatRules::RevivesDebtor.
+    Map<uint32_t, DeadDebtor> m_deadDebtors;
+    //! @brief TG01 debtors seen alive this session, a death after that has its killer recorded in this session.
+    Set<uint32_t> m_debtorsSeenAlive;
 };

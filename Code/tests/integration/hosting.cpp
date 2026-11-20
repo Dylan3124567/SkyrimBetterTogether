@@ -67,6 +67,7 @@ int main(int argc, char** argv)
         bool InParty = false;
         int Invites = 0;
         int QuestUpdates = 0;
+        uint8_t QuestStatus = 0;
         uint32_t ActorId = 0;
         uint32_t ActorEpoch = 0;
         int Movements = 0;
@@ -143,7 +144,10 @@ int main(int argc, char** argv)
                                 break;
                             }
                             case kNotifyPartyLeft: peer.InParty = false; break;
-                            case kNotifyQuestUpdate: ++peer.QuestUpdates; break;
+                            case kNotifyQuestUpdate:
+                                ++peer.QuestUpdates;
+                                peer.QuestStatus = static_cast<NotifyQuestUpdate&>(*message).Status;
+                                break;
                             case kNotifyActivate: ++peer.Activations; break;
                             case kNotifyNewPackage: ++peer.Packages; break;
                             case kNotifyHelgenState: {
@@ -428,6 +432,28 @@ int main(int argc, char** argv)
     send(a, quest);
     pump(300);
     check(c.QuestUpdates == 7, "background quests without a journal entry are not shared");
+    quest.Id = GameId(1, 126);
+    quest.ClientQuestType = 7;
+    quest.Stage = 0;
+    quest.Status = RequestQuestUpdate::Started;
+    send(a, quest);
+    pump(300);
+    quest.Stage = 500;
+    quest.Status = RequestQuestUpdate::StageUpdate;
+    send(a, quest);
+    pump(300);
+    quest.Status = RequestQuestUpdate::Failed;
+    send(a, quest);
+    pump(300);
+    check(c.QuestUpdates == 10 && c.QuestStatus == RequestQuestUpdate::Failed, "a failed quest reaches the party as failed");
+    quest.Status = RequestQuestUpdate::Stopped;
+    send(b, quest);
+    pump(300);
+    check(c.QuestUpdates == 10 && c.QuestStatus == RequestQuestUpdate::Failed, "a member's own stop after a relayed failure is not relayed again");
+    quest.Status = static_cast<uint8_t>(RequestQuestUpdate::Failed + 1);
+    send(a, quest);
+    pump(300);
+    check(c.QuestUpdates == 10, "an unknown quest status is not relayed");
     send(b, PartyLeaveRequest{});
     send(c, PartyLeaveRequest{});
     pump(500);

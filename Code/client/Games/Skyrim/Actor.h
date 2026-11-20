@@ -204,10 +204,14 @@ struct Actor : TESObjectREFR
     Factions GetFactions() const noexcept;
     ActorValues GetEssentialActorValues() const noexcept;
     [[nodiscard]] bool IsDead() const noexcept;
+    // What the game asks before it kills instead of knocking the actor down: not essential, a child or protected from it
+    [[nodiscard]] bool CanBeKilledBy(Actor* apAttacker) noexcept;
     [[nodiscard]] bool IsDragon() const noexcept;
     [[nodiscard]] bool IsPlayerSummon() const noexcept;
     [[nodiscard]] bool IsInCombat() const noexcept;
     [[nodiscard]] Actor* GetCombatTarget() const noexcept;
+    // The furniture or idle marker the actor's AI put it in, nullptr if none. A remote copy only plays the poses.
+    [[nodiscard]] TESObjectREFR* GetOccupiedFurniture() const noexcept;
     [[nodiscard]] bool HasPerk(uint32_t aPerkFormId) const noexcept;
     [[nodiscard]] uint8_t GetPerkRank(uint32_t aPerkFormId) const noexcept;
     [[nodiscard]] bool IsVampireLord() const noexcept;
@@ -239,7 +243,19 @@ struct Actor : TESObjectREFR
     void GenerateMagicCasters() noexcept;
     void DispelAllSpells(bool aNow = false) noexcept;
     void Reset() noexcept;
+    /**
+     * @param aForceDeathAction A death another client had: the killer recorded with it is used, and this game's
+     * essential and protected flags, which come from its own quests, don't keep the actor alive.
+     */
     void Kill(bool aForceDeathAction = false) noexcept;
+    // A killing blow from another client's player, which protected doesn't stop any more than this client's player
+    void KillByPlayer(Actor* apPlayer) noexcept;
+    // Into bleedout the way the game puts an essential actor at zero health there
+    void KnockDown() noexcept;
+    // Up from bleedout with the given health
+    void StandUp(float aHealth) noexcept;
+    // Back to life where it lies, as the console's resurrect does
+    void Revive() noexcept;
     void Respawn() noexcept;
     void PickUpObject(TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2) noexcept;
     void DropObject(TESBoundObject* apObject, ExtraDataList* apExtraData, int32_t aCount, NiPoint3* apLocation, NiPoint3* apRotation) noexcept;

@@ -49,7 +49,8 @@ protected:
         LeaderClaim,
         Mount,
         Relinquish,
-        OwnerUnavailable
+        OwnerUnavailable,
+        Dialogue
     };
 
     void OnUpdate(const UpdateEvent& acEvent) const noexcept;
@@ -78,6 +79,8 @@ protected:
     bool CanClaimOwnership(Player* apPlayer, entt::entity aEntity, uint32_t aExpectedOwnershipEpoch, OwnershipTransferReason aReason, const CellIdComponent* apArrivalCell = nullptr) const noexcept;
     bool TransferOwnership(Player* apPlayer, entt::entity aEntity, OwnershipTransferReason aReason, bool aResetInvalidOwners = true) const noexcept;
     void TransferToNextOwner(entt::entity aEntity, OwnershipTransferReason aReason) const noexcept;
+    // Spawns an NPC for the players whose range it came into, and removes it for those it left
+    void NotifyRangeChange(entt::entity aEntity, const CellIdComponent& acPreviousCell, const Player* apOwner) const noexcept;
     ActorData BuildActorData(const entt::entity acEntity) const noexcept;
 
     void ProcessFactionsChanges() const noexcept;
@@ -107,4 +110,6 @@ private:
 
     // When actors died, in game hours, for those whose entity went away with the last client around them
     mutable TiltedPhoques::Map<GameId, int64_t> m_deadActors;
+    // The quest alias that made each temporary actor, see Structs/QuestRole.h
+    mutable TiltedPhoques::Map<entt::entity, std::pair<GameId, uint32_t>> m_questRoles;
 };

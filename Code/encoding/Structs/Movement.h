@@ -28,4 +28,6 @@ struct Movement
     float Direction{};
     // The owner has the actor in furniture or restrained, remote copies can't work this out from the animations alone
     bool IsHeldInPlace{};
+    // The furniture or idle marker the owner has the actor in, only sent while held, empty for temporary references
+    GameId FurnitureId{};
 };

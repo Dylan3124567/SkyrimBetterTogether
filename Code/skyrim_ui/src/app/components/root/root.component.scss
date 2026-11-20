@@ -189,10 +189,21 @@ app-window.multiplayer-shortcut {
   z-index: 100;
   display: flex;
   flex-direction: column;
-  border-width: calc(var(--sbt-u) * 16);
-  background: #000;
-  color: #e8e2d0;
-  // English fits with room for one wrapped label; a longer translation is cut rather than painted past the box.
+  // The frame is drawn 16 units wide but reserves only 6, so labels can use the width between its corners.
+  border-width: calc(var(--sbt-u) * 6);
+  border-image: url('../../../assets/images/frame/fancy-ornaments.svg') 26 /
+    calc(var(--sbt-u) * 16);
+  padding: calc(var(--sbt-u) * 4) 0;
+  // The Journal's panels are the scene darkened to about a third (rgb 21,18,11 at the top to 8,8,5 in the capture).
+  // Translucency would let the game's cursor show through, so a scene-like dark gradient is painted instead.
+  background: radial-gradient(
+      ellipse 90% 60% at 30% 0%,
+      rgb(46 39 28 / 0.45),
+      transparent
+    ),
+    linear-gradient(rgb(20 17 12), rgb(9 8 6));
+  color: #fff;
+  // fitShortcut scales the text down until a long translation fits; anything left over is cut, never painted outside.
   overflow: hidden;
   visibility: hidden;
 
@@ -201,44 +212,64 @@ app-window.multiplayer-shortcut {
   }
 }
 
+// Skyrim's Journal draws list entries in $EverywhereMediumFont ("Futura Condensed", the cut the shipped
+// futura-condensed-medium matches) in white without letter spacing; its smaller entries are 16 units of its 720-line
+// stage, a cap height of 18 at 1080 lines. Entries here are 22 units (cap height 16): at 24 the five connected
+// entries fill the box edge to edge with no gap between rows.
 .multiplayer-shortcut-title {
   // The left padding balances the letter-spacing trailing the last letter.
-  padding: calc(var(--sbt-u) * 2) 0 calc(var(--sbt-u) * 7) 0.25em;
-  font-size: calc(var(--sbt-u) * 12);
-  letter-spacing: 0.25em;
+  padding: 0 0 calc(var(--sbt-u) * 5) 0.1em;
+  font-size: calc(var(--sbt-u) * 14 * var(--sbt-fit, 1));
+  letter-spacing: 0.1em;
   text-align: center;
   text-transform: uppercase;
-  opacity: 0.6;
-  background: linear-gradient(to right, transparent, currentColor, transparent)
-    bottom / 100% 1px no-repeat;
+  // The Journal's heading grey, over its divider line.
+  color: #ddd;
+  background: linear-gradient(
+      to right,
+      transparent,
+      rgb(255 255 255 / 0.3),
+      transparent
+    )
+    bottom / 100% calc(var(--sbt-u) * 1.5) no-repeat;
 }
 
 .multiplayer-shortcut-entries {
   flex: 1 1 auto;
+  // Lets the rows below shrink from their 32 units instead of this column refusing to.
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  // Rows that do not fit overflow downwards only, where fitShortcut measures them, never up over the title.
+  justify-content: safe center;
+  // Keeps a wrapped translation's lines visibly apart from the next entry when the rows are packed.
+  row-gap: calc(var(--sbt-u) * 4 * var(--sbt-fit, 1));
 
   > button {
+    // A row is 32 units while there is room and shrinks towards the text when all five entries are shown.
+    flex: 0 1 calc(var(--sbt-u) * 32 * var(--sbt-fit, 1));
     justify-content: center;
-    padding: calc(var(--sbt-u) * 3.5) 0;
-    font-size: calc(var(--sbt-u) * 15);
-    letter-spacing: 0.06em;
+    padding: 0;
+    font-size: calc(var(--sbt-u) * 22 * var(--sbt-fit, 1));
     text-align: center;
     color: inherit;
-    opacity: 0.8;
-    --cooldown-lit: #e8e2d0;
+    opacity: 1;
+    --cooldown-lit: #fff;
 
     &::before,
     &::after {
       display: none;
     }
 
+    // Entries are always full white like the Journal's, so the pointer lights the row instead.
     &:hover:not([disabled]),
     &[data-style-active='true'] {
-      color: #fff;
-      opacity: 1;
-      --cooldown-lit: #fff;
+      background: linear-gradient(
+        to right,
+        transparent,
+        rgb(255 255 255 / 0.12),
+        transparent
+      );
     }
   }
 }

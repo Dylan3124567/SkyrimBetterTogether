@@ -58,13 +58,12 @@ uint8_t TP_MAKE_THISCALL(HookPerformAction, ActorMediator, TESActionData* apActi
         action.TargetEventName = apAction->targetEventName.AsAscii();
         action.IdleId = apAction->idleForm ? apAction->idleForm->formID : 0;
 
-        // Save for later
+        // An action the graph refused didn't play here, and remote copies force every action they get (issue 9)
         if (res)
         {
             pExtension->LatestAnimation = action;
+            World::Get().GetRunner().Trigger(action);
         }
-
-        World::Get().GetRunner().Trigger(action);
 
         return res;
     }

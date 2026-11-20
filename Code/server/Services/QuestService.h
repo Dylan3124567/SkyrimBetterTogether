@@ -8,9 +8,7 @@ struct UpdateEvent;
 struct RequestQuestUpdate;
 
 /**
- * @brief Dispatch quest sync messages.
- *
- * This service is currently not in use.
+ * @brief Relays quest starts, stages and stops to the rest of the sender's party, see QuestSharing.h.
  */
 class QuestService
 {

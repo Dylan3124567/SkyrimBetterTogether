@@ -8,10 +8,12 @@
 #include <Services/TransportService.h>
 
 #include <Games/References.h>
+#include <Games/Misc/MenuTopicManager.h>
 #include <Games/Misc/SubtitleManager.h>
 
 #include <Forms/ActorValueInfo.h>
 #include <Forms/TESNPC.h>
+#include <Forms/TESGlobal.h>
 #include <Interface/UI.h>
 #include <Forms/TESQuest.h>
 
@@ -43,6 +45,7 @@
 #include <Services/HelgenService.h>
 #include <Systems/SyncRules.h>
 #include <Systems/NpcSyncRules.h>
+#include <Structs/QuestRole.h>
 #include <Messages/AssignCharacterResponse.h>
 #include <Messages/ServerReferencesMoveRequest.h>
 #include <Messages/ClientReferencesMoveRequest.h>
@@ -126,6 +129,101 @@ static bool IsLoadingScreenUp() noexcept
 static bool IsAlreadyPlaced(const Actor* apActor, const uint32_t aCellId, const glm::vec3& acPosition) noexcept
 {
     return apActor->parentCell && apActor->parentCell->formID == aCellId && glm::distance(glm::vec3(apActor->position), acPosition) < NpcSyncRules::cAlreadyPlacedDistance;
+}
+
+// The same world space outside, the same cell inside
+static bool IsInSameSpace(const TESObjectREFR* apReference, const TESObjectREFR* apOther) noexcept
+{
+    const TESWorldSpace* pWorldSpace = apOther->GetWorldSpace();
+    return pWorldSpace ? apReference->GetWorldSpace() == pWorldSpace : apReference->parentCell && apReference->parentCell == apOther->parentCell;
+}
+
+// Whether the actor is where the owner's snapshots have it, as far as this client has that place
+static bool IsInOwnerSpace(const Actor* apActor, const InterpolationComponent& acInterpolationComponent) noexcept
+{
+    if (acInterpolationComponent.OwnerWorldSpace)
+    {
+        const TESWorldSpace* pWorldSpace = apActor->GetWorldSpace();
+        return pWorldSpace && pWorldSpace->formID == acInterpolationComponent.OwnerWorldSpace;
+    }
+
+    return !acInterpolationComponent.OwnerCell || (apActor->parentCell && apActor->parentCell->formID == acInterpolationComponent.OwnerCell);
+}
+
+// Camp tents and bedrolls are enabled by scripts on each client, so the furniture an owner uses can be missing here
+static bool IsFurnitureHere(const uint32_t aFormId) noexcept
+{
+    const auto* pFurniture = Cast<TESObjectREFR>(TESForm::GetById(aFormId));
+    return pFurniture && !pFurniture->IsDisabled() && !pFurniture->IsDeleted();
+}
+
+// Replayed actions copy the previous owner's actor state and poses onto a remote actor, and the copy's own AI may have taken
+// furniture it never entered, its actions being refused. The AI taking over put it in none of that furniture or those
+// restraints, so nothing would ever get it out of them: it stayed seated in the air or stood frozen, weapon away. It goes
+// back if it should be there. An ambush that woke up on this client did go in by itself, its AI gets it out properly.
+static void HandToLocalAi(Actor* apActor, const bool aMayBeSeated) noexcept
+{
+    if (apActor->GetExtension()->IsPlayer() || apActor->IsDead() || IsHelgenIntroRunning())
+        return;
+
+    const bool cAmbushAwake = NpcSyncRules::IsAmbushAwake(apActor->GetActorValue(ActorValueInfo::kVariable01), apActor->GetActorValue(ActorValueInfo::kAggression));
+    if ((apActor->actorState.IsHeldInPlace() || aMayBeSeated || apActor->GetOccupiedFurniture()) && !cAmbushAwake)
+        apActor->ReleaseFromFurniture(true);
+    else if (!IsLoadingScreenUp())
+        apActor->EvaluatePackage();
+}
+
+// Copies are temporary and stay remote while tracked, anything else under the id is no longer the copy
+static void DeleteCopy(const uint32_t aFormId) noexcept
+{
+    Actor* pActor = Cast<Actor>(TESForm::GetById(aFormId));
+    if (!pActor || !pActor->IsTemporary() || pActor->IsDeleted() || !pActor->GetExtension()->IsRemote())
+        return;
+
+    // The Delete native (56154) marks the reference deleted and drops its 3D, directly or through the task queue
+    spdlog::info("Deleting remote copy {:X}", aFormId);
+    pActor->Delete();
+}
+
+/**
+ * The quest alias that made a temporary actor, see QuestRole. Read from ExtraAliasInstanceArray (0x88) the way the game's
+ * alias essential check (12733) does: entries at +0x10, their count at +0x20, the lock at +0x28, each entry a quest and its
+ * BGSRefAlias, whose alias id is at +0x18. The first entry is the alias the actor was made for.
+ */
+static bool GetQuestRole(World& aWorld, Actor* apActor, GameId& aQuestId, uint32_t& aAliasId) noexcept
+{
+    struct AliasInstance
+    {
+        TESQuest* pQuest;
+        const uint8_t* pAlias;
+    };
+
+    using TLock = void(void*);
+    POINTER_SKYRIMSE(TLock, s_lockForRead, 68233);
+    POINTER_SKYRIMSE(TLock, s_unlockForRead, 68239);
+
+    auto* pExtra = reinterpret_cast<uint8_t*>(apActor->extraData.GetByType(ExtraDataType::AliasInstanceArray));
+    if (!apActor->IsTemporary() || !pExtra)
+        return false;
+
+    TESQuest* pQuest = nullptr;
+    uint32_t aliasId = 0;
+
+    s_lockForRead.Get()(pExtra + 0x28);
+    const auto& instances = *reinterpret_cast<GameArray<const AliasInstance*>*>(pExtra + 0x10);
+    if (instances.length > 0 && instances[0] && instances[0]->pAlias)
+    {
+        pQuest = instances[0]->pQuest;
+        aliasId = *reinterpret_cast<const uint32_t*>(instances[0]->pAlias + 0x18);
+    }
+    s_unlockForRead.Get()(pExtra + 0x28);
+
+    // Read against the quest itself, a layout that ever moves only costs the deduplication
+    if (!pQuest || pQuest->GetAliasedRef(aliasId) != apActor || !aWorld.GetModSystem().GetServerModId(pQuest->formID, aQuestId))
+        return false;
+
+    aAliasId = aliasId;
+    return QuestRole::IsRole(aQuestId.BaseId, aAliasId, true);
 }
 
 CharacterService::CharacterService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
@@ -243,8 +341,11 @@ void CharacterService::ReconcileActorData(
         m_weaponDrawUpdates[apActor->formID] = {acActorData.IsWeaponDrawn};
 }
 
-void CharacterService::KillWhenReady(Actor* apActor) const noexcept
+void CharacterService::KillWhenReady(Actor* apActor, Actor* apKiller) const noexcept
 {
+    // Kept with the actor until the kill goes through, a forced Kill takes it from there
+    apActor->killerHandle = apKiller ? apKiller->GetHandle().handle.iBits : 0;
+
     // An actor that isn't ready refuses the death action too. Without 3D there is no body to drop, it loads as a corpse.
     if (apActor->GetNiNode() && (!apActor->animationGraphHolder.IsReady() || IsLoadingScreenUp()))
     {
@@ -276,7 +377,7 @@ void CharacterService::ProcessPendingDeaths() noexcept
     }
 }
 
-bool CharacterService::RequestOwnership(const uint32_t aFormId, const uint32_t aServerId, const entt::entity aEntity) const noexcept
+bool CharacterService::RequestOwnership(const uint32_t aFormId, const uint32_t aServerId, const entt::entity aEntity, const bool aForDialogue) const noexcept
 {
     Actor* pActor = Cast<Actor>(TESForm::GetById(aFormId));
     if (!pActor)
@@ -305,6 +406,7 @@ bool CharacterService::RequestOwnership(const uint32_t aFormId, const uint32_t a
     RequestOwnershipClaim request;
     request.ServerId = aServerId;
     request.ExpectedOwnershipEpoch = pRemoteComponent->OwnershipEpoch;
+    request.ForDialogue = aForDialogue;
 
     if (!m_transport.Send(request))
         return false;
@@ -324,6 +426,82 @@ void CharacterService::DeleteTempActor(const uint32_t aFormId) noexcept
             pActor->Delete();
             spdlog::info("\tDeleted actor {:X}", aFormId);
         }
+    }
+}
+
+Actor* CharacterService::CreateRemoteCopy(const uint32_t aServerId, TESNPC* apNpc) const noexcept
+{
+    // An actor never has two copies: whatever showed it before is gone for good by now
+    if (const uint32_t cOldCopy = m_remoteCopies.Remove(aServerId))
+        DeleteCopy(cOldCopy);
+
+    Actor* pActor = Actor::Create(apNpc);
+    if (!pActor)
+        return nullptr;
+
+    DeleteCopy(m_remoteCopies.Add(aServerId, pActor->formID));
+    return pActor;
+}
+
+void CharacterService::ReleaseRemoteActor(const entt::entity aEntity) const noexcept
+{
+    const auto* pRemoteComponent = m_world.try_get<RemoteComponent>(aEntity);
+    if (!pRemoteComponent)
+        return;
+
+    // A copy goes whatever state it is in, undiscovered or given an alias by a local quest included. Kept, it stood frozen
+    // and faceless where it was last moved, next to the copy made the next time the same player came into range.
+    if (const uint32_t cCopyId = m_remoteCopies.Remove(pRemoteComponent->Id))
+        DeleteCopy(cCopyId);
+    else
+    {
+        // An entity that was never discovered knows its actor by the cached id only
+        const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(aEntity);
+        const uint32_t cFormId = pFormIdComponent ? pFormIdComponent->Id : pRemoteComponent->CachedRefId;
+        if (Actor* pActor = Cast<Actor>(TESForm::GetById(cFormId)))
+        {
+            if (pActor->IsTemporary())
+                DeleteTempActor(cFormId);
+            else
+                pActor->GetExtension()->SetRemote(false);
+
+            // Kept by this client's game, one of its plugins' actors or a quest's. Restraints as in OnDisconnected.
+            const auto* pInterpolationComponent = m_world.try_get<InterpolationComponent>(aEntity);
+            if (!pActor->IsDeleted() && pActor->GetNiNode() && !pActor->actorState.IsRestrained() && !IsLoadingScreenUp())
+                HandToLocalAi(pActor, pInterpolationComponent && pInterpolationComponent->MayBeInFurniture);
+        }
+    }
+
+    DeleteRemoteEntityComponents(aEntity);
+}
+
+// A copy the game deleted under its entity used to make that entity turn down every later spawn of the actor, which then
+// was never seen again. One left in another interior or world space, as when both players take the same door, comes along.
+void CharacterService::RefreshSpawnedActor(const CharacterSpawnRequest& acMessage) const noexcept
+{
+    auto view = m_world.view<RemoteComponent>();
+    const auto it = std::find_if(view.begin(), view.end(), [view, id = acMessage.ServerId](auto aEntity) { return view.get<RemoteComponent>(aEntity).Id == id; });
+    if (it == view.end())
+        return;
+
+    const entt::entity cEntity = *it;
+    const auto& remoteComponent = view.get<RemoteComponent>(cEntity);
+    Actor* pActor = Cast<Actor>(TESForm::GetById(remoteComponent.CachedRefId));
+
+    if (const uint32_t cCopyId = m_remoteCopies.Find(remoteComponent.Id); cCopyId && (!pActor || pActor->IsDeleted() || pActor->formID != cCopyId))
+    {
+        spdlog::warn("Copy of remote actor {:X} is gone, spawning it again", acMessage.ServerId);
+        ReleaseRemoteActor(cEntity);
+        if (m_world.orphan(cEntity))
+            m_world.destroy(cEntity);
+        return;
+    }
+
+    const auto* pPlayer = PlayerCharacter::Get();
+    if (pActor && !pActor->IsDeleted() && pPlayer->parentCell && !IsInSameSpace(pActor, pPlayer) && !IsHelgenIntroRunning() && !IsLoadingScreenUp())
+    {
+        spdlog::info("Moving already spawned actor {:X} to the player's {:X}", pActor->formID, pPlayer->parentCell->formID);
+        pActor->MoveTo(pPlayer->parentCell, acMessage.Position);
     }
 }
 
@@ -402,6 +580,8 @@ void CharacterService::OnActorRemoved(const ActorRemovedEvent& acEvent) noexcept
 void CharacterService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
 {
     RunSpawnUpdates();
+    RunCopyCleanup();
+    RunCaravanUpdates();
     RunLocalUpdates();
     RunAppearanceUpdates();
     ProcessAppearanceUpdates();
@@ -446,22 +626,44 @@ void CharacterService::OnConnected(const ConnectedEvent& acConnectedEvent) const
 
 void CharacterService::OnDisconnected(const DisconnectedEvent& acDisconnectedEvent) const noexcept
 {
-    auto remoteView = m_world.view<FormIdComponent, RemoteComponent>();
+    // Copies only show other clients' actors, undiscovered ones included. The game's own actors stop being remote.
+    for (const uint32_t cCopyId : m_remoteCopies.TakeAll())
+        DeleteCopy(cCopyId);
+
+    // Run here, but still another game's actor: kept, it was assigned again as this client's own on reconnecting
+    for (const uint32_t cCopyId : m_ownedCopies)
+    {
+        if (Actor* pCopy = Cast<Actor>(TESForm::GetById(cCopyId)); pCopy && pCopy->IsTemporary() && !pCopy->IsDeleted())
+            pCopy->Delete();
+    }
+    m_ownedCopies.clear();
+
+    auto remoteView = m_world.view<RemoteComponent>();
+    Vector<entt::entity> undiscovered;
     for (auto entity : remoteView)
     {
-        auto& formIdComponent = remoteView.get<FormIdComponent>(entity);
+        const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(entity);
+        if (!pFormIdComponent)
+            undiscovered.push_back(entity);
 
-        auto pActor = Cast<Actor>(TESForm::GetById(formIdComponent.Id));
-        if (!pActor)
+        auto* pActor = Cast<Actor>(TESForm::GetById(pFormIdComponent ? pFormIdComponent->Id : remoteView.get<RemoteComponent>(entity).CachedRefId));
+        if (!pActor || pActor->IsDeleted())
             continue;
 
-        if (pActor->GetExtension()->IsRemotePlayer())
-            pActor->Delete();
-        else
-            pActor->GetExtension()->SetRemote(false);
+        pActor->GetExtension()->SetRemote(false);
+
+        // Seated by its owner's actions it stayed seated for good once offline, see HandToLocalAi. A captive's restraints
+        // are left alone, this client's own quest has most likely bound it as well.
+        const auto* pInterpolationComponent = m_world.try_get<InterpolationComponent>(entity);
+        if (pActor->GetNiNode() && !pActor->actorState.IsRestrained() && !IsLoadingScreenUp())
+            HandToLocalAi(pActor, pInterpolationComponent && pInterpolationComponent->MayBeInFurniture);
     }
 
     m_world.clear<WaitingForAssignmentComponent, LocalComponent, RemoteComponent>();
+
+    // Nothing else is left of an entity that was never discovered
+    for (const auto entity : undiscovered)
+        m_world.destroy(entity);
 
     for (const auto& [formId, pickFormId] : m_pendingLeveledConforms)
     {
@@ -576,6 +778,9 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
 
         m_weaponDrawUpdates.erase(pActor->formID);
 
+        // An actor is local or remote, never both
+        m_world.remove<RemoteComponent, InterpolationComponent, RemoteAnimationComponent>(cEntity);
+
         auto& localAnimationComponent = m_world.emplace_or_replace<LocalAnimationComponent>(cEntity);
 
         if (auto* pEarlyAnimComponent = m_world.try_get<EarlyAnimationBufferComponent>(cEntity))
@@ -597,6 +802,23 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
     {
         spdlog::info("Received remote actor, form id: {:X}, isweapondrawn: {}", pActor->formID, acMessage.IsWeaponDrawn);
 
+        // This client's own actor of a quest role shows the entity now (QuestRole). A copy made for it earlier goes, two
+        // actors showing one were two dragons.
+        if (const uint32_t cCopyId = m_remoteCopies.Find(acMessage.ServerId); cCopyId && cCopyId != pActor->formID)
+        {
+            auto copyView = m_world.view<RemoteComponent>();
+            const auto copyIt = std::find_if(copyView.begin(), copyView.end(), [copyView, cEntity, id = acMessage.ServerId](auto aEntity) { return aEntity != cEntity && copyView.get<RemoteComponent>(aEntity).Id == id; });
+            if (copyIt != copyView.end())
+            {
+                const entt::entity cCopyEntity = *copyIt;
+                spdlog::info("Actor {:X} shows server id {:X} in place of copy {:X}", pActor->formID, acMessage.ServerId, cCopyId);
+                ReleaseRemoteActor(cCopyEntity);
+                if (m_world.orphan(cCopyEntity))
+                    m_world.destroy(cCopyEntity);
+            }
+        }
+
+        m_world.remove<LocalComponent, LocalAnimationComponent>(cEntity);
         m_world.emplace_or_replace<RemoteComponent>(cEntity, acMessage.ServerId, formIdComponent->Id, acMessage.OwnershipEpoch);
 
         pActor->GetExtension()->SetRemote(true);
@@ -630,6 +852,8 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) 
         spdlog::warn("Ignored spawn for actor {:X} because the ownership epoch is invalid", acMessage.ServerId);
         return;
     }
+
+    RefreshSpawnedActor(acMessage);
 
     auto remoteView = m_world.view<RemoteComponent>();
     const auto remoteItor = std::find_if(std::begin(remoteView), std::end(remoteView), [remoteView, Id = acMessage.ServerId](auto entity) { return remoteView.get<RemoteComponent>(entity).Id == Id; });
@@ -689,6 +913,7 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) 
             if (!pNpc)
             {
                 spdlog::error("Failed to retrieve NPC, it will not be spawned, possibly missing mod, base: {:X}:{:X}, form: {:X}:{:X}", acMessage.BaseId.BaseId, acMessage.BaseId.ModId, acMessage.FormId.BaseId, acMessage.FormId.ModId);
+                m_world.destroy(*entity);
                 return;
             }
 
@@ -701,7 +926,7 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) 
             FaceGenSystem::Setup(m_world, *entity, acMessage.FaceTints);
         }
 
-        pActor = Actor::Create(pNpc);
+        pActor = CreateRemoteCopy(acMessage.ServerId, pNpc);
     }
     else
     {
@@ -748,7 +973,16 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) 
         const auto itor = std::find_if(std::begin(view), std::end(view), [cActorId, view](entt::entity entity) { return view.get<FormIdComponent>(entity).Id == cActorId; });
 
         if (itor != std::end(view))
+        {
+            // Sent before the server gave the actor to this client. Taken, it would leave the actor both local and remote.
+            if (const auto* pLocalComponent = m_world.try_get<LocalComponent>(*itor); pLocalComponent && pLocalComponent->OwnershipEpoch >= acMessage.OwnershipEpoch)
+            {
+                spdlog::info("Ignored stale spawn of actor {:X}, this client owns it at epoch {}", cActorId, pLocalComponent->OwnershipEpoch);
+                return;
+            }
+
             entity = *itor;
+        }
         else
             entity = m_world.create();
     }
@@ -799,6 +1033,7 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) 
     if (acMessage.FormId != GameId{} || acMessage.HelgenAliasId)
         ApplyLeveledNpcPick(pActor, acMessage.LeveledNpcPickId);
 
+    m_world.remove<LocalComponent, LocalAnimationComponent>(*entity);
     m_world.emplace_or_replace<RemoteComponent>(*entity, acMessage.ServerId, pActor->formID, acMessage.OwnershipEpoch);
 
     auto& interpolationComponent = InterpolationSystem::Setup(m_world, *entity);
@@ -838,9 +1073,18 @@ void CharacterService::OnReferencesMoveRequest(const ServerReferencesMoveRequest
             continue;
 
         auto& interpolationComponent = view.get<InterpolationComponent>(*itor);
+        auto& modSystem = m_world.GetModSystem();
 
         interpolationComponent.OwnerHoldsInPlace = movement.IsHeldInPlace;
         interpolationComponent.LastSnapshot = cArrivalTime;
+        interpolationComponent.HasOwnerState = true;
+        // Without a furniture id, restrained or in a temporary one, the owner is taken at its word
+        const uint32_t cFurnitureId = movement.IsHeldInPlace && movement.FurnitureId ? modSystem.GetGameId(movement.FurnitureId) : 0;
+        const bool cFurnitureHere = cFurnitureId && IsFurnitureHere(cFurnitureId);
+        interpolationComponent.OwnerFurnitureMissing = movement.IsHeldInPlace && movement.FurnitureId && !cFurnitureHere;
+        interpolationComponent.OwnerFurniture = cFurnitureHere ? cFurnitureId : 0;
+        interpolationComponent.OwnerWorldSpace = movement.WorldSpaceId ? modSystem.GetGameId(movement.WorldSpaceId) : 0;
+        interpolationComponent.OwnerCell = movement.WorldSpaceId ? 0 : modSystem.GetGameId(movement.CellId);
 
         InterpolationComponent::TimePoint point;
         point.Tick = acMessage.Tick;
@@ -870,6 +1114,14 @@ void CharacterService::OnNotifyActionEvents(const NotifyActionEvents& acMessage)
         for (const auto& action : actions)
         {
             animationComponent.TimePoints.push_back(action);
+        }
+
+        // A copy that can't play them, out of sight or still loading, would act its owner's past out once it can
+        while (animationComponent.TimePoints.size() > SyncRules::cMaxQueuedActions)
+        {
+            animationComponent.TimePoints.pop_front();
+            if (animationComponent.ReplayCount > 0)
+                animationComponent.ReplayCount--;
         }
     }
 }
@@ -999,6 +1251,14 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
         ReconcileActorData(cEntity, pActor, acMessage.OwnershipEpoch, acMessage.CurrentActorData, true, true);
         ApplyLeveledNpcPick(pActor, acMessage.LeveledNpcPickId);
 
+        const auto* pOldInterpolationComponent = m_world.try_get<InterpolationComponent>(cEntity);
+        const bool cMayBeSeated = pOldInterpolationComponent && pOldInterpolationComponent->MayBeInFurniture;
+
+        // A copy this client made runs here now, which nothing may delete as an orphaned copy. It still stands in for another
+        // client's actor: kept once let go, it came back as a new actor of this client's and doubled up (QuestRole).
+        if (const uint32_t cCopyId = m_remoteCopies.Remove(acMessage.ServerId))
+            m_ownedCopies.insert(cCopyId);
+
         DeleteRemoteEntityComponents(cEntity);
         CacheSystem::Setup(m_world, cEntity, pActor);
         m_world.emplace_or_replace<LocalAnimationComponent>(cEntity);
@@ -1008,18 +1268,7 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
 
         // LocalComponent is installed only after canonical reconciliation is complete.
         pActor->GetExtension()->SetRemote(false);
-
-        // Replayed actions copy the previous owner's actor state onto ours. The AI now taking over never put the actor in
-        // that furniture or those restraints, so nothing would ever get it out of them. It'll go back if it should be there.
-        // An ambush that woke up on this client did go in by itself, and its AI gets it out with the proper animation.
-        const bool cAmbushAwake = NpcSyncRules::IsAmbushAwake(pActor->GetActorValue(ActorValueInfo::kVariable01), pActor->GetActorValue(ActorValueInfo::kAggression));
-        if (!pActor->GetExtension()->IsPlayer() && !pActor->IsDead() && !IsHelgenIntroRunning())
-        {
-            if (pActor->actorState.IsHeldInPlace() && !cAmbushAwake)
-                pActor->ReleaseFromFurniture(true);
-            else if (!IsLoadingScreenUp())
-                pActor->EvaluatePackage();
-        }
+        HandToLocalAi(pActor, cMayBeSeated);
 
         spdlog::info("Gained ownership of actor {:X} at epoch {}", acMessage.ServerId, acMessage.OwnershipEpoch);
         return;
@@ -1033,6 +1282,10 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
     if (pFormIdComponent)
     {
         m_world.emplace_or_replace<RemoteComponent>(cEntity, acMessage.ServerId, pFormIdComponent->Id, acMessage.OwnershipEpoch);
+
+        // A copy this client ran is a copy again
+        if (m_ownedCopies.erase(pFormIdComponent->Id))
+            DeleteCopy(m_remoteCopies.Add(acMessage.ServerId, pFormIdComponent->Id));
 
         // The new owner carries on from its own, older view of the actor and stamps snapshots with its own clock, so the
         // previous owner's snapshots and timing estimates would only drag the actor back. Start over from where it is now.
@@ -1061,36 +1314,32 @@ void CharacterService::OnRemoveCharacter(const NotifyRemoveCharacter& acMessage)
 
     const auto itor = std::find_if(std::begin(view), std::end(view), [id = acMessage.ServerId, view](entt::entity entity) { return view.get<RemoteComponent>(entity).Id == id; });
 
-    if (itor != std::end(view))
-    {
-        if (auto* pFormIdComponent = m_world.try_get<FormIdComponent>(*itor))
-        {
-            Actor* pActor = Cast<Actor>(TESForm::GetById(pFormIdComponent->Id));
-            if (pActor && pActor->IsTemporary())
-                CharacterService::DeleteTempActor(pFormIdComponent->Id);
-            else if (pActor)
-                pActor->GetExtension()->SetRemote(false);
+    if (itor == std::end(view))
+        return;
 
-            const entt::entity cEntity = *itor;
-            DeleteRemoteEntityComponents(cEntity);
+    const entt::entity cEntity = *itor;
+    const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(cEntity);
+    Actor* pActor = pFormIdComponent ? Cast<Actor>(TESForm::GetById(pFormIdComponent->Id)) : nullptr;
 
-            // Still here in an interior means the entity is gone, or the actor went somewhere else and the server will say
-            // where. Left like this it would run its AI without anyone else ever hearing of it.
-            if (pActor && !pActor->IsTemporary() && pActor->GetNiNode() && !pActor->GetWorldSpace() && pActor->parentCell == PlayerCharacter::Get()->parentCell)
-                ProcessNewEntity(cEntity);
+    // Still here in an interior means the entity is gone, or the actor went somewhere else and the server will say
+    // where. Left like this it would run its AI without anyone else ever hearing of it.
+    const bool cReprocess = pActor && !pActor->IsTemporary() && pActor->GetNiNode() && !pActor->GetWorldSpace() && pActor->parentCell == PlayerCharacter::Get()->parentCell;
 
-            return;
-        }
+    // Not discovered yet too: its copy used to stay where it stood, frozen and without its face, for good
+    ReleaseRemoteActor(cEntity);
 
-        DeleteRemoteEntityComponents(*itor);
-    }
+    if (cReprocess)
+        ProcessNewEntity(cEntity);
+    else if (!pFormIdComponent && m_world.orphan(cEntity))
+        m_world.destroy(cEntity);
 }
 
 void CharacterService::RunAppearanceUpdates(bool aForce) noexcept
 {
     if (!m_transport.IsOnline() || !m_world.ctx().at<HelgenService>().CreatingCharacters() || (!aForce && m_transport.GetLastPollTime() < m_nextAppearance))
         return;
-    m_nextAppearance = m_transport.GetLastPollTime() + 0.5;
+    // Poll times are in milliseconds, every half second is plenty while sliders move
+    m_nextAppearance = m_transport.GetLastPollTime() + 500.0;
     auto view = m_world.view<FormIdComponent, LocalComponent>();
     for (auto entity : view)
     {
@@ -1213,7 +1462,7 @@ void CharacterService::ProcessAppearanceUpdates() noexcept
 
 void CharacterService::OnNotifyRespawn(const NotifyRespawn& acMessage) const noexcept
 {
-    auto view = m_world.view<FormIdComponent, RemoteComponent>();
+    auto view = m_world.view<RemoteComponent>();
     const auto entityIt = std::find_if(view.begin(), view.end(), [view, id = acMessage.ActorId](auto aEntity) { return view.get<RemoteComponent>(aEntity).Id == id; });
 
     if (entityIt == view.end())
@@ -1224,8 +1473,8 @@ void CharacterService::OnNotifyRespawn(const NotifyRespawn& acMessage) const noe
 
     const auto cId = *entityIt;
 
-    auto& formIdComponent = view.get<FormIdComponent>(cId);
-    CancelServerAssignment(*entityIt, formIdComponent.Id);
+    // A copy not discovered yet goes as well, the spawn the server sends back makes the only one there is
+    ReleaseRemoteActor(cId);
 
     m_world.remove<EarlyAnimationBufferComponent>(cId);
 
@@ -1676,6 +1925,15 @@ void CharacterService::ProcessNewEntity(entt::entity aEntity) const noexcept
     if (m_world.any_of<RemoteComponent, LocalComponent, WaitingForAssignmentComponent>(aEntity))
         return;
 
+    // Temporary and remote with no entity showing it is a copy of another client's actor that was left behind. Reported as
+    // this client's own it became a new character on the server, and another copy on every other client, its owner's too.
+    if (pActor->IsDeleted() || (pActor->IsTemporary() && pActor->GetExtension()->IsRemote()))
+    {
+        spdlog::warn("Not reporting actor {:X}, it is a leftover copy of another client's actor", pActor->formID);
+        DeleteCopy(pActor->formID);
+        return;
+    }
+
     CacheSystem::Setup(World::Get(), aEntity, pActor);
 
     RequestServerAssignment(aEntity);
@@ -1702,6 +1960,8 @@ void CharacterService::RequestServerAssignment(const entt::entity aEntity) const
 
     message.Cookie = sCookieSeed;
     message.HelgenAliasId = GetHelgenAliasId(pActor);
+    if (!message.HelgenAliasId && GetQuestRole(m_world, pActor, message.RoleQuestId, message.RoleAliasId))
+        spdlog::info("Actor {:X} was made by alias {} of quest {:X}:{:X}", pActor->formID, message.RoleAliasId, message.RoleQuestId.ModId, message.RoleQuestId.BaseId);
 
     if (!m_world.GetModSystem().GetServerModId(formIdComponent.Id, message.ReferenceId))
     {
@@ -1846,22 +2106,7 @@ void CharacterService::CancelServerAssignment(const entt::entity aEntity, const 
 {
     if (m_world.all_of<RemoteComponent>(aEntity))
     {
-        Actor* pActor = Cast<Actor>(TESForm::GetById(aFormId));
-
-        if (pActor)
-        {
-            if (pActor->IsTemporary())
-            {
-                DeleteTempActor(aFormId);
-            }
-            else
-            {
-                pActor->GetExtension()->SetRemote(false);
-            }
-        }
-
-        DeleteRemoteEntityComponents(aEntity);
-
+        ReleaseRemoteActor(aEntity);
         return;
     }
 
@@ -1914,6 +2159,16 @@ void CharacterService::CancelServerAssignment(const entt::entity aEntity, const 
         m_transport.Send(request);
 
         m_world.remove<LocalAnimationComponent, LocalComponent>(aEntity);
+
+        // A copy goes with its entity like any other, see m_ownedCopies
+        if (m_ownedCopies.erase(aFormId))
+        {
+            if (Actor* pCopy = Cast<Actor>(TESForm::GetById(aFormId)); pCopy && pCopy->IsTemporary() && !pCopy->IsDeleted())
+            {
+                spdlog::info("Deleting copy {:X} this client ran until now", aFormId);
+                pCopy->Delete();
+            }
+        }
     }
 }
 
@@ -1962,7 +2217,7 @@ Actor* CharacterService::CreateCharacterForEntity(entt::entity aEntity) const no
             FaceGenSystem::Setup(m_world, aEntity, acMessage.FaceTints);
         }
 
-        pActor = Actor::Create(pNpc);
+        pActor = CreateRemoteCopy(m_world.get<RemoteComponent>(aEntity).Id, pNpc);
     }
 
     auto& remoteComponent = m_world.get<RemoteComponent>(aEntity);
@@ -2228,6 +2483,9 @@ void CharacterService::RunRemoteUpdates() noexcept
     // Playback can only rely on snapshots that have been handled, so it runs on the time they were last picked up at.
     const double cNow = m_transport.GetLastPollTime();
     const bool cCanClaimActors = !m_world.ctx().at<HelgenService>().DeferActors() && !IsHelgenIntroRunning() && !IsLoadingScreenUp();
+    // Looking up who the player talks to takes a handle per actor, only worth it while the dialogue menu is open at all
+    const MenuTopicManager* pTopicManager = MenuTopicManager::Get();
+    const bool cInDialogue = pTopicManager && pTopicManager->menuOpen;
 
     // Interpolation has to keep running even if the actor is not in view, otherwise we will never know if we need to spawn it
     auto interpolatedEntities = m_world.view<RemoteComponent, InterpolationComponent>();
@@ -2247,33 +2505,64 @@ void CharacterService::RunRemoteUpdates() noexcept
         if (pActor && m_pendingAppearances.contains(pActor->formID))
             continue;
         const auto* player = m_world.try_get<PlayerComponent>(entity);
-        if (!player || !m_world.ctx().at<HelgenService>().StagePlayer(pActor, player->Id))
+        const bool cIsStaged = player && m_world.ctx().at<HelgenService>().StagePlayer(pActor, player->Id);
+        if (!cIsStaged)
             InterpolationSystem::Update(pActor, interpolationComponent, cNow);
+
+        // Taken to another interior or world space by its owner, which only its movement says. Positions there mean
+        // nothing in the cell it is in here, and nobody looking for it where it went would find it.
+        if (pActor && !cIsStaged && interpolationComponent.HasOwnerState && !pActor->IsDead() && cCanClaimActors &&
+            cNow - interpolationComponent.LastSpaceMove >= SyncRules::cPresenceCheckTime && !IsInOwnerSpace(pActor, interpolationComponent))
+        {
+            interpolationComponent.LastSpaceMove = cNow;
+
+            auto* pCell = Cast<TESObjectCELL>(TESForm::GetById(interpolationComponent.OwnerCell));
+            if (auto* pWorldSpace = Cast<TESWorldSpace>(TESForm::GetById(interpolationComponent.OwnerWorldSpace)))
+            {
+                const auto cCoordinates = GridCellCoords::CalculateGridCellCoords(interpolationComponent.Position.x, interpolationComponent.Position.y);
+                pCell = pWorldSpace->LoadCell(cCoordinates.X, cCoordinates.Y);
+            }
+
+            if (pCell)
+            {
+                spdlog::info("Moving actor {:X} to cell {:X}, where its owner has it", pActor->formID, pCell->formID);
+                pActor->MoveTo(pCell, interpolationComponent.Position);
+            }
+        }
 
         if (pActor && !interpolationComponent.TimePoints.empty() && !pActor->IsDead() && !IsHelgenIntroRunning())
         {
+            // An owner in furniture this client doesn't have counts as out of it, its copy stands where the owner sits
+            const bool cOwnerInFurniture = interpolationComponent.IsOwnerInFurnitureHere();
             // A copy still held after its owner left. Players are left out here as their furniture use goes through
             // activation and the shared sleep barrier, which keeps their state right.
-            const bool cHeldAfterOwner = !player && SyncRules::ShouldReleaseFurniture(pActor->actorState.IsHeldInPlace(), interpolationComponent.OwnerHoldsInPlace, cNow,
+            const bool cHeldAfterOwner = !player && SyncRules::ShouldReleaseFurniture(pActor->actorState.IsHeldInPlace(), cOwnerInFurniture, cNow,
                                                                                       interpolationComponent.HeldMismatchStart);
             // A body left in a furniture pose its state no longer shows, players included
-            const bool cPoseAfterOwner = SyncRules::ShouldLeaveFurniture(interpolationComponent.OwnerHoldsInPlace, cNow, interpolationComponent.MayBeInFurniture,
+            const bool cPoseAfterOwner = SyncRules::ShouldLeaveFurniture(cOwnerInFurniture, cNow, interpolationComponent.MayBeInFurniture,
                                                                          interpolationComponent.OwnerOutOfFurnitureSince);
             if (cHeldAfterOwner || cPoseAfterOwner)
+            {
                 pActor->ReleaseFromFurniture(false);
+                // Getting out puts the behavior graph back in its default pose, without the weapon the owner may have out
+                if (pActor->actorState.IsWeaponDrawn())
+                    m_weaponDrawUpdates[pActor->formID] = {true};
+            }
         }
 
-        // Nobody else will run this actor if its owner stopped, and an ambush that woke here has to wake where its AI runs
+        // Nobody else will run this actor if its owner stopped, and an ambush that woke here has to wake where its AI runs.
+        // Someone talking to it here needs its AI here too, only that makes it stop for them instead of walking off.
         if (pActor && !player)
         {
             const bool cCanClaim = cCanClaimActors && !pActor->IsDead() && pActor->GetNiNode() && !pActor->IsTemporary() && !pActor->IsMount() && !pActor->IsPlayerSummon();
             const bool cWokeUnderOwner = interpolationComponent.OwnerHoldsInPlace &&
                                          NpcSyncRules::IsAmbushAwake(pActor->GetActorValue(ActorValueInfo::kVariable01), pActor->GetActorValue(ActorValueInfo::kAggression));
+            const bool cTalkedTo = cInDialogue && cCanClaim && MenuTopicManager::IsPlayerDialogueSpeaker(pActor);
 
-            if (NpcSyncRules::ShouldClaimActor(cCanClaim, cWokeUnderOwner, cNow, interpolationComponent.LastSnapshot, interpolationComponent.LastClaim))
+            if (NpcSyncRules::ShouldClaimActor(cCanClaim, cWokeUnderOwner || cTalkedTo, cNow, interpolationComponent.LastSnapshot, interpolationComponent.LastClaim))
             {
-                spdlog::info("Claiming actor {:X}, owner silent for {} ms, woke here: {}", pActor->formID, cNow - interpolationComponent.LastSnapshot, cWokeUnderOwner);
-                RequestOwnership(pActor->formID, interpolatedEntities.get<RemoteComponent>(entity).Id, entity);
+                spdlog::info("Claiming actor {:X}, owner silent for {} ms, woke here: {}, talked to: {}", pActor->formID, cNow - interpolationComponent.LastSnapshot, cWokeUnderOwner, cTalkedTo);
+                RequestOwnership(pActor->formID, interpolatedEntities.get<RemoteComponent>(entity).Id, entity, cTalkedTo);
             }
         }
     }
@@ -2293,21 +2582,25 @@ void CharacterService::RunRemoteUpdates() noexcept
         // Actions run on the clock the interpolation pass above just advanced, so the body and its animations stay in step
         if (m_world.ctx().at<HelgenService>().CreatingCharacters() && m_world.all_of<PlayerComponent>(entity))
             continue;
-        const auto cTick = InterpolationSystem::GetPlaybackTick(animatedView.get<InterpolationComponent>(entity));
+        auto& interpolationComponent = animatedView.get<InterpolationComponent>(entity);
+        const auto cTick = InterpolationSystem::GetPlaybackTick(interpolationComponent);
 
-        AnimationSystem::Update(m_world, pActor, animationComponent, cTick);
+        AnimationSystem::Update(m_world, pActor, animationComponent, interpolationComponent, cTick);
     }
 
-    auto facegenView = m_world.view<FormIdComponent, FaceGenComponent>();
+    auto facegenView = m_world.view<FaceGenComponent>();
 
     for (auto entity : facegenView)
     {
-        auto& formIdComponent = facegenView.get<FormIdComponent>(entity);
         auto& faceGenComponent = facegenView.get<FaceGenComponent>(entity);
 
-        const auto* pForm = TESForm::GetById(formIdComponent.Id);
-        auto* pActor = Cast<Actor>(pForm);
-        if (!pActor)
+        // Copies far enough away are seen before discovery picks them up, without their face they looked black
+        const auto* pFormIdComponent = m_world.try_get<FormIdComponent>(entity);
+        const auto* pRemoteComponent = m_world.try_get<RemoteComponent>(entity);
+        const uint32_t cFormId = pFormIdComponent ? pFormIdComponent->Id : pRemoteComponent ? pRemoteComponent->CachedRefId : 0;
+
+        auto* pActor = Cast<Actor>(TESForm::GetById(cFormId));
+        if (!pActor || pActor->IsDeleted())
             continue;
 
         FaceGenSystem::Update(m_world, pActor, faceGenComponent);
@@ -2473,38 +2766,149 @@ void CharacterService::RunFactionsUpdates() const noexcept
 
 void CharacterService::RunSpawnUpdates() const noexcept
 {
+    const auto* pPlayer = PlayerCharacter::Get();
+    if (!pPlayer->parentCell || IsLoadingScreenUp())
+        return;
+
     auto invisibleView = m_world.view<RemoteComponent, InterpolationComponent, RemoteAnimationComponent, WaitingFor3D>(entt::exclude<FormIdComponent>);
     Vector<entt::entity> entities(invisibleView.begin(), invisibleView.end());
 
     for (const auto entity : entities)
     {
         auto& remoteComponent = m_world.get<RemoteComponent>(entity);
-        auto& interpolationComponent = m_world.get<InterpolationComponent>(entity);
+        const glm::vec3 cPosition = m_world.get<InterpolationComponent>(entity).Position;
 
-        if (const auto pWorldSpace = PlayerCharacter::Get()->GetWorldSpace())
+        // Outside only the grid around the player is loaded, an interior only gets spawns for the actors in it
+        if (pPlayer->GetWorldSpace())
         {
-            float characterX = interpolationComponent.Position.x;
-            float characterY = interpolationComponent.Position.y;
-            const auto characterCoords = GridCellCoords::CalculateGridCellCoords(characterX, characterY);
+            const auto characterCoords = GridCellCoords::CalculateGridCellCoords(cPosition.x, cPosition.y);
             const TES* pTES = TES::Get();
-            const auto playerCoords = GridCellCoords(pTES->centerGridX, pTES->centerGridY);
-
-            // TODO(cosideci): IsDragon probably shouldn't be straight up false here.
-            if (GridCellCoords::IsCellInGridCell(characterCoords, playerCoords, false))
-            {
-                auto* pActor = Cast<Actor>(TESForm::GetById(remoteComponent.CachedRefId));
-                if (!pActor)
-                {
-                    pActor = CreateCharacterForEntity(entity);
-                    if (!pActor)
-                        continue;
-
-                    remoteComponent.CachedRefId = pActor->formID;
-                }
-
-                pActor->MoveTo(PlayerCharacter::Get()->parentCell, interpolationComponent.Position);
-            }
+            if (!GridCellCoords::IsCellInGridCell(characterCoords, GridCellCoords(pTES->centerGridX, pTES->centerGridY), false))
+                continue;
         }
+
+        Actor* pActor = Cast<Actor>(TESForm::GetById(remoteComponent.CachedRefId));
+        if (!pActor || pActor->IsDeleted())
+        {
+            // Only a copy this client makes from the spawn can be made again, placed where the actor is as it is made. A
+            // plugin's or quest's reference that is gone stays gone, and a copy that can't be made won't be next frame
+            // either: the entity goes, with one log line instead of one every frame.
+            const auto& cSpawn = m_world.get<WaitingFor3D>(entity).SpawnRequest;
+            Actor* pCopy = cSpawn.FormId == GameId{} && !cSpawn.HelgenAliasId ? CreateCharacterForEntity(entity) : nullptr;
+            if (pCopy)
+            {
+                remoteComponent.CachedRefId = pCopy->formID;
+                continue;
+            }
+
+            spdlog::warn("Dropping remote actor {:X}, its reference {:X} is gone and can't be made here", remoteComponent.Id, remoteComponent.CachedRefId);
+            ReleaseRemoteActor(entity);
+            if (m_world.orphan(entity))
+                m_world.destroy(entity);
+
+            continue;
+        }
+
+        // Moved every frame, the copy kept starting its 3D over and could never be discovered: invisible, or standing there
+        // without its face. It only needs a move to get into the right cell or world space, or after falling far behind.
+        if (SyncRules::ShouldMoveCopy(IsInSameSpace(pActor, pPlayer), glm::distance(glm::vec3(pActor->position), cPosition)))
+            pActor->MoveTo(pPlayer->parentCell, cPosition);
+        else
+            pActor->ForcePosition(cPosition);
+    }
+}
+
+void CharacterService::RunCopyCleanup() noexcept
+{
+    const double cNow = m_transport.GetLastPollTime();
+    if (cNow < m_nextCopyCleanup)
+        return;
+
+    m_nextCopyCleanup = cNow + SyncRules::cPresenceCheckTime;
+
+    // Every way an entity stops showing an actor deletes its copy, this is for one that ever doesn't
+    Set<uint32_t> shown;
+    auto view = m_world.view<RemoteComponent>();
+    for (auto entity : view)
+        shown.insert(view.get<RemoteComponent>(entity).Id);
+
+    for (const uint32_t cFormId : m_remoteCopies.TakeOrphans([&shown](const uint32_t aServerId) { return shown.contains(aServerId); }))
+    {
+        spdlog::warn("Remote copy {:X} was left without an entity", cFormId);
+        DeleteCopy(cFormId);
+    }
+}
+
+// What GlobalVariable.SetValue (native 55923) does: refuse a constant (form flag 0x40), write the float at 0x34
+static void SetGlobalValue(const uint32_t aFormId, const float aValue) noexcept
+{
+    auto* pGlobal = Cast<TESGlobal>(TESForm::GetById(aFormId));
+    if (pGlobal && !(pGlobal->flags & 0x40) && pGlobal->f != aValue)
+        pGlobal->f = aValue;
+}
+
+void CharacterService::RunCaravanUpdates() noexcept
+{
+    const double cNow = m_transport.GetLastPollTime();
+    if (cNow < m_nextCaravanUpdate)
+        return;
+
+    m_nextCaravanUpdate = cNow + SyncRules::cPresenceCheckTime;
+
+    if (!m_transport.IsOnline() || IsLoadingScreenUp())
+        return;
+
+    auto* pQuest = Cast<TESQuest>(TESForm::GetById(CaravanRules::kCaravansQuest));
+    if (!pQuest)
+        return;
+
+    // The calls CaravanScript.ToggleCamp makes, Enable(false) and Disable(false), without waiting on the fade
+    using ObjectReference = TESObjectREFR;
+    PAPYRUS_FUNCTION(void, ObjectReference, EnableNoWait, bool);
+    PAPYRUS_FUNCTION(void, ObjectReference, DisableNoWait, bool);
+
+    const auto* pPlayer = PlayerCharacter::Get();
+    const TESWorldSpace* pPlayerWorldSpace = pPlayer->GetWorldSpace();
+    const bool cPlayerInTamriel = pPlayerWorldSpace && pPlayerWorldSpace->formID == CaravanRules::kTamriel;
+    const TES* pTES = TES::Get();
+
+    for (size_t i = 0; i < CaravanRules::kCaravans.size(); ++i)
+    {
+        const auto& caravan = CaravanRules::kCaravans[i];
+        auto& tracker = m_caravanCamps[i];
+
+        // Only a copy shows where another client has its caravan. A caravan this client's AI runs keeps its own camps.
+        Actor* pLeader = Cast<Actor>(pQuest->GetAliasedRef(caravan.LeaderAlias));
+        const TESWorldSpace* pLeaderWorldSpace = pLeader ? pLeader->GetWorldSpace() : nullptr;
+        if (!pLeader || !pLeader->GetExtension()->IsRemote() || pLeader->IsDead() || !pLeader->GetNiNode() || !pLeaderWorldSpace ||
+            pLeaderWorldSpace->formID != CaravanRules::kTamriel)
+        {
+            tracker.Reset();
+            continue;
+        }
+
+        const int cCamp = tracker.Update(CaravanRules::FindCamp(caravan, pLeader->position.x, pLeader->position.y));
+        if (cCamp < 0)
+            continue;
+
+        const auto& camp = caravan.Camps[cCamp];
+        if (auto* pMarker = Cast<TESObjectREFR>(TESForm::GetById(camp.EnableMarker)); pMarker && pMarker->IsDisabled())
+        {
+            spdlog::info("Setting up caravan camp {:X}, the leader {:X} another client runs is camped there", camp.EnableMarker, pLeader->formID);
+            s_pEnableNoWait(pMarker, false);
+        }
+
+        // The caravan isn't at its other camp any more, but tents must not vanish in front of the player
+        const auto& otherCamp = caravan.Camps[1 - cCamp];
+        auto* pOtherMarker = Cast<TESObjectREFR>(TESForm::GetById(otherCamp.EnableMarker));
+        if (pOtherMarker && !pOtherMarker->IsDisabled() && CaravanRules::CanHideCamp(cPlayerInTamriel, pTES->centerGridX, pTES->centerGridY, otherCamp))
+        {
+            spdlog::info("Taking down caravan camp {:X}, its caravan is camped elsewhere", otherCamp.EnableMarker);
+            s_pDisableNoWait(pOtherMarker, false);
+        }
+
+        SetGlobalValue(caravan.LocationGlobal, CaravanRules::LocationValue(static_cast<size_t>(cCamp)));
+        SetGlobalValue(caravan.CampedGlobal, CaravanRules::kCampedValue);
     }
 }
 

@@ -30,7 +30,8 @@ struct AssignCharacterRequest final : ClientMessage
     bool operator==(const AssignCharacterRequest& acRhs) const noexcept
     {
         return GetOpcode() == acRhs.GetOpcode() && Cookie == acRhs.Cookie && ReferenceId == acRhs.ReferenceId && FormId == acRhs.FormId && CellId == acRhs.CellId && WorldSpaceId == acRhs.WorldSpaceId && Position == acRhs.Position && Rotation == acRhs.Rotation && ChangeFlags == acRhs.ChangeFlags &&
-               AppearanceBuffer == acRhs.AppearanceBuffer && FactionsContent == acRhs.FactionsContent && LatestAction == acRhs.LatestAction && FaceTints == acRhs.FaceTints && QuestContent == acRhs.QuestContent && IsDragon == acRhs.IsDragon && IsMount == acRhs.IsMount && IsPlayerSummon == acRhs.IsPlayerSummon && LeveledNpcPickId == acRhs.LeveledNpcPickId && HelgenAliasId == acRhs.HelgenAliasId;
+               AppearanceBuffer == acRhs.AppearanceBuffer && FactionsContent == acRhs.FactionsContent && LatestAction == acRhs.LatestAction && FaceTints == acRhs.FaceTints && QuestContent == acRhs.QuestContent && IsDragon == acRhs.IsDragon && IsMount == acRhs.IsMount && IsPlayerSummon == acRhs.IsPlayerSummon && LeveledNpcPickId == acRhs.LeveledNpcPickId && HelgenAliasId == acRhs.HelgenAliasId &&
+               RoleQuestId == acRhs.RoleQuestId && RoleAliasId == acRhs.RoleAliasId;
     }
 
     uint32_t Cookie{};
@@ -38,6 +39,9 @@ struct AssignCharacterRequest final : ClientMessage
     GameId FormId{};
     GameId LeveledNpcPickId{};
     uint32_t HelgenAliasId{}; // MQ101 alias identity for temporary NPCs; zero means none.
+    // The quest alias that made a temporary actor, the same actor to every client running the quest (Structs/QuestRole.h)
+    GameId RoleQuestId{};
+    uint32_t RoleAliasId{};
     GameId CellId{};
     GameId WorldSpaceId{};
     Vector3_NetQuantize Position{};

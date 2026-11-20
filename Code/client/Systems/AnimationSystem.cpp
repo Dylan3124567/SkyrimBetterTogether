@@ -21,15 +21,18 @@
 #include <Forms/TESWorldSpace.h>
 
 #include <Systems/NpcSyncRules.h>
+#include <Systems/SyncRules.h>
 
 static_assert(NpcSyncRules::cLifeStateMask == ActorState::kLifeStateMask);
+static_assert(ActionEvent::kFurnitureStateMask == ActorState::kSitSleepStateMask);
 
-void AnimationSystem::Update(World& aWorld, Actor* apActor, RemoteAnimationComponent& aAnimationComponent, const uint64_t aTick) noexcept
+void AnimationSystem::Update(World& aWorld, Actor* apActor, RemoteAnimationComponent& aAnimationComponent, InterpolationComponent& aInterpolationComponent, const uint64_t aTick) noexcept
 {
     auto& actions = aAnimationComponent.TimePoints;
 
     const auto it = std::begin(actions);
-    if (it != std::end(actions) && it->Tick <= aTick)
+    const bool cHasDueAction = it != std::end(actions) && it->Tick <= aTick;
+    if (cHasDueAction || aAnimationComponent.ResetAnimationGraphForReplay)
     {
         // Check if animation graph is ready before attempting to play animations
         if (!apActor->animationGraphHolder.IsReady())
@@ -37,16 +40,42 @@ void AnimationSystem::Update(World& aWorld, Actor* apActor, RemoteAnimationCompo
             // Animation graph not ready, keep the action in queue and try again later
             return;
         }
-        if (aAnimationComponent.ReplayCount > 0 && aAnimationComponent.ResetAnimationGraphForReplay)
+        // Also when the replay has nothing left to play, as when getting up was the last thing its owner did
+        if (aAnimationComponent.ResetAnimationGraphForReplay)
         {
             apActor->animationGraphHolder.RevertAnimationGraphManager();
             aAnimationComponent.ResetAnimationGraphForReplay = false;
         }
 
+        if (!cHasDueAction)
+            return;
+
         const auto& first = *it;
 
+        // Played now it would sit the copy down where its owner no longer is, or where the furniture is missing
+        const bool cIsSeating = first.IsSeatingAction();
+        if (cIsSeating && !SyncRules::ShouldPlaySeatingAction(aInterpolationComponent.HasOwnerState, aInterpolationComponent.IsOwnerInFurnitureHere()))
+        {
+            spdlog::debug("Skipped seating action {} on {:X}, its owner is out of furniture this client has", first.EventName.c_str(), apActor->formID);
+
+            if (aAnimationComponent.ReplayCount > 0)
+                aAnimationComponent.ReplayCount--;
+
+            actions.pop_front();
+            return;
+        }
+
+        if (cIsSeating)
+            aInterpolationComponent.MayBeInFurniture = true;
+
         const auto actionId = first.ActionId;
-        const auto targetId = first.TargetId;
+
+        // Target ids are the owner's own form ids. A temporary one means nothing here, or something else entirely, and
+        // a plugin loaded in another place moves the rest. The furniture comes from the owner's snapshots instead, which
+        // name it the way every client understands, and the furniture is what a furniture action targets.
+        uint32_t targetId = first.TargetId < 0xFF000000 ? first.TargetId : 0;
+        if (cIsSeating && aInterpolationComponent.OwnerFurniture)
+            targetId = aInterpolationComponent.OwnerFurniture;
 
         const auto pAction = Cast<BGSAction>(TESForm::GetById(actionId));
         const auto pTarget = Cast<TESObjectREFR>(TESForm::GetById(targetId));
@@ -128,6 +157,15 @@ void AnimationSystem::SerializeMovement(World& aWorld, Actor* apActor, Movement&
 
     apActor->SaveAnimationVariables(aMovement.Variables);
     aMovement.IsHeldInPlace = apActor->actorState.IsHeldInPlace();
+
+    // Copies only sit when this furniture is there for them too. A temporary one means nothing on other clients.
+    aMovement.FurnitureId = {};
+    if (aMovement.IsHeldInPlace)
+    {
+        const TESObjectREFR* pFurniture = apActor->GetOccupiedFurniture();
+        if (pFurniture && !pFurniture->IsTemporary())
+            aWorld.GetModSystem().GetServerModId(pFurniture->formID, aMovement.FurnitureId);
+    }
 
     if (apActor->currentProcess && apActor->currentProcess->middleProcess)
     {

@@ -261,6 +261,12 @@ void DiscoveryService::VisitForms() noexcept
             {
                 continue;
             }
+
+            // A copy of another client's actor is temporary and remote. One still in a loaded cell is reloading its 3D after
+            // being moved to where its owner has it, or has dropped out of high process at a distance. Removed, it was deleted
+            // and nothing would make it again: the actor stayed invisible while right there.
+            if (pActor->IsTemporary() && pActor->GetExtension()->IsRemote() && pCell && pCell->IsAttached())
+                continue;
         }
 
         m_dispatcher.trigger(ActorRemovedEvent(formId));

@@ -41,6 +41,8 @@ public:
     static UI* Get();
 
     bool GetMenuOpen(const BSFixedString& acName) const;
+    // A menu vanilla pauses the game for is open while the fork keeps the world running
+    bool IsUnpausedMenuOpen() const;
     void CloseAllMenus();
     void DebugLogAllMenus();
     void NotifyPauseChange(bool aPaused);

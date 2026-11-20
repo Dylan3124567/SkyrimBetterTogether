@@ -1,6 +1,7 @@
 #pragma once
 
 #include <DateTime.h>
+#include <Structs/TimeSyncRules.h>
 #include <Events/EventDispatcher.h>
 #include <Games/Events.h>
 
@@ -38,6 +39,7 @@ private:
 
     DateTime m_onlineTime;
     DateTime m_offlineTime;
+    TimeSyncRules::DaysPassed m_daysPassed;
     float m_fadeTimer = 0.f;
     static bool s_gameClockLocked;
 

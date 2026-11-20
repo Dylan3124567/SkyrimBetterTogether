@@ -59,4 +59,5 @@ private:
     entt::scoped_connection m_sleepConnection;
     SleepBarrier m_sleep;
     uint64_t m_sleepDeadline{};
+    uint64_t m_nextResync{};
 };

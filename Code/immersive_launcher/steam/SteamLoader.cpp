@@ -1,5 +1,6 @@
 
 #include "SteamLoader.h"
+#include "SystemDllShadows.h"
 #include "TargetConfig.h"
 
 #include "Utils/Registry.h"
@@ -35,6 +36,16 @@ void Load(const fs::path& aGameDir)
     const auto gameApi = aGameDir / L"steam_api64.dll";
     if (fs::exists(gameApi))
         LoadLibraryW(gameApi.c_str());
+
+    // The Steam folder is searched before System32 from here on, for every SKSE plugin too (issue 922: a dwmapi.dll
+    // proxy there failed SKSE Menu Framework with error 193)
+    wchar_t systemDir[MAX_PATH]{};
+    const UINT cSystemDirLength = GetSystemDirectoryW(systemDir, MAX_PATH);
+    if (cSystemDirLength > 0 && cSystemDirLength < MAX_PATH)
+    {
+        for (const auto& cDll : SystemDllShadows(steamPath, systemDir, {aGameDir, TiltedPhoques::GetPath()}))
+            LoadLibraryW(cDll.c_str());
+    }
 
     AddDllDirectory(steamPath.c_str());
 

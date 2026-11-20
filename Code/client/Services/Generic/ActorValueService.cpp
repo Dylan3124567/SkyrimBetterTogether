@@ -24,6 +24,38 @@
 #include <Messages/RequestDeathStateChange.h>
 
 #include <misc/ActorValueOwner.h>
+#include <Forms/TESQuest.h>
+#include <PlayerCharacter.h>
+#include <Systems/CombatRules.h>
+
+namespace
+{
+// The game of the client sending a blow would only knock the actor down if its player dealt it
+bool IsKnockOnly(Actor* apActor) noexcept
+{
+    return apActor && !apActor->CanBeKilledBy(PlayerCharacter::Get());
+}
+
+// Server ids are entity integers and 0 is one, see DeathMemory::cNoActor
+uint32_t GetServerIdOf(World& aWorld, const TESObjectREFR* apReference) noexcept
+{
+    if (!apReference)
+        return DeathMemory::cNoActor;
+
+    auto view = aWorld.view<FormIdComponent>();
+    for (auto entity : view)
+    {
+        if (view.get<FormIdComponent>(entity).Id == apReference->formID)
+            return Utils::GetServerId(entity).value_or(DeathMemory::cNoActor);
+    }
+    return DeathMemory::cNoActor;
+}
+
+Actor* GetActorByServerId(const uint32_t aServerId) noexcept
+{
+    return aServerId != DeathMemory::cNoActor ? Utils::GetByServerId<Actor>(aServerId) : nullptr;
+}
+} // namespace
 
 ActorValueService::ActorValueService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
     : m_world(aWorld)
@@ -31,6 +63,7 @@ ActorValueService::ActorValueService(World& aWorld, entt::dispatcher& aDispatche
     , m_transport(aTransport)
 {
     m_world.on_construct<LocalComponent>().connect<&ActorValueService::OnLocalComponentAdded>(this);
+    m_world.on_destroy<LocalComponent>().connect<&ActorValueService::OnLocalComponentRemoved>(this);
     m_dispatcher.sink<DisconnectedEvent>().connect<&ActorValueService::OnDisconnected>(this);
     m_dispatcher.sink<ActorRemovedEvent>().connect<&ActorValueService::OnActorRemoved>(this);
     m_dispatcher.sink<UpdateEvent>().connect<&ActorValueService::OnUpdate>(this);
@@ -68,16 +101,28 @@ void ActorValueService::OnLocalComponentAdded(entt::registry& aRegistry, const e
     }
 }
 
+void ActorValueService::OnLocalComponentRemoved(entt::registry& aRegistry, const entt::entity aEntity) noexcept
+{
+    m_downActors.erase(aEntity);
+}
+
 void ActorValueService::OnDisconnected(const DisconnectedEvent& acEvent) noexcept
 {
     // Batched damage uses server IDs, which can refer to different actors after reconnecting.
     m_smallHealthChanges.clear();
+    m_downActors.clear();
+    m_knockedOut.clear();
+    m_deadDebtors.clear();
     // TODO: investigate the previously reported intermittent component-clear crash.
     m_world.clear<ActorValuesComponent>();
 }
 
 void ActorValueService::OnActorRemoved(const ActorRemovedEvent& acEvent) noexcept
 {
+    m_knockedOut.erase(acEvent.FormId);
+    // Unloaded, how long it has been dead here counts again from the next time it is seen
+    m_deadDebtors.erase(acEvent.FormId);
+
     if (!m_transport.IsConnected())
         return;
 
@@ -102,6 +147,7 @@ void ActorValueService::OnUpdate(const UpdateEvent& acEvent) noexcept
     RunSmallHealthUpdates();
     RunDeathStateUpdates();
     RunActorValuesUpdates();
+    RunBrawlRepairs();
 }
 
 void ActorValueService::BroadcastActorValues() noexcept
@@ -199,6 +245,8 @@ void ActorValueService::OnHealthChange(const HealthChangeEvent& acEvent) noexcep
     RequestHealthChangeBroadcast requestHealthChange;
     requestHealthChange.Id = serverId;
     requestHealthChange.DeltaHealth = acEvent.DeltaHealth;
+    // A brawl's opponent is essential only on the brawling player's client, its owner has to hear it
+    requestHealthChange.NonLethal = IsKnockOnly(Cast<Actor>(TESForm::GetById(acEvent.HitteeId)));
 
     m_transport.Send(requestHealthChange);
 
@@ -223,6 +271,7 @@ void ActorValueService::RunSmallHealthUpdates() noexcept
             RequestHealthChangeBroadcast requestHealthChange;
             requestHealthChange.Id = value.first;
             requestHealthChange.DeltaHealth = value.second;
+            requestHealthChange.NonLethal = IsKnockOnly(Utils::GetByServerId<Actor>(value.first));
 
             m_transport.Send(requestHealthChange);
 
@@ -255,19 +304,99 @@ void ActorValueService::RunDeathStateUpdates() noexcept
 
         auto& localComponent = localView.get<LocalComponent>(entity);
 
-        bool isDead = pActor->IsDead();
-        if (isDead != localComponent.IsDead)
+        const bool isDead = pActor->IsDead();
+        // Players go down and get up through the respawn flow
+        const bool isDown = !isDead && !pActor->GetExtension()->IsPlayer() && pActor->actorState.IsBleedingOut();
+        const bool wasDown = m_downActors.contains(entity);
+        if (!isDown)
+            m_knockedOut.erase(pActor->formID);
+        if (isDead == localComponent.IsDead && isDown == wasDown)
+            continue;
+
+        const bool cDies = isDead && !localComponent.IsDead;
+        localComponent.IsDead = isDead;
+        if (isDown)
+            m_downActors.insert(entity);
+        else
+            m_downActors.erase(entity);
+
+        RequestDeathStateChange requestChange;
+        requestChange.Id = localComponent.Id;
+        requestChange.OwnershipEpoch = localComponent.OwnershipEpoch;
+        requestChange.IsDead = isDead;
+        requestChange.IsDown = isDown;
+        requestChange.Health = pActor->GetActorValue(ActorValueInfo::kHealth);
+        // Other clients' copies die with the same killer, OnDeath scripts like Erandur's check akKiller
+        if (cDies)
+            requestChange.KillerId = GetServerIdOf(m_world, TESObjectREFR::GetByHandle(pActor->killerHandle));
+
+        spdlog::info(
+            "Sending death state {}, down: {}, killer: {:X} for local actor {:X}, server id: {:X}", isDead, isDown, requestChange.KillerId, pActor->formID, localComponent.Id);
+
+        m_transport.Send(requestChange);
+    }
+}
+
+void ActorValueService::RunBrawlRepairs() noexcept
+{
+    static std::chrono::steady_clock::time_point lastRunTimePoint;
+    constexpr auto cDelayBetweenRuns = 1000ms;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastRunTimePoint < cDelayBetweenRuns || !m_transport.IsConnected())
+        return;
+
+    lastRunTimePoint = now;
+
+    if (auto* pBrawl = Cast<TESQuest>(TESForm::GetById(CombatRules::cBrawlQuest)); pBrawl && pBrawl->IsEnabled())
+    {
+        const Actor* pOpponent = Cast<Actor>(pBrawl->GetAliasedRef(CombatRules::cBrawlOpponentAlias));
+        if (pOpponent && CombatRules::EndsBrawl(true, pBrawl->IsStageDone(CombatRules::cBrawlEndStage), pOpponent->IsDead()))
         {
-            localComponent.IsDead = isDead;
+            spdlog::info("Ending the brawl against {:X}, who died in it", pOpponent->formID);
+            pBrawl->SetStage(CombatRules::cBrawlEndStage);
+        }
+    }
 
-            spdlog::info("Sending death state {} for local actor {:X}, server id: {:X}", isDead, pActor->formID, localComponent.Id);
+    auto* pDebtJob = Cast<TESQuest>(TESForm::GetById(CombatRules::cTG01));
+    if (!pDebtJob || !pDebtJob->IsEnabled())
+        return;
 
-            RequestDeathStateChange requestChange;
-            requestChange.Id = localComponent.Id;
-            requestChange.OwnershipEpoch = localComponent.OwnershipEpoch;
-            requestChange.IsDead = isDead;
+    for (const auto& debtor : CombatRules::cTG01Debtors)
+    {
+        Actor* pDebtor = Cast<Actor>(pDebtJob->GetAliasedRef(debtor.AliasId));
+        if (!pDebtor)
+            continue;
 
-            m_transport.Send(requestChange);
+        const uint32_t cFormId = pDebtor->formID;
+        if (!pDebtor->IsDead())
+        {
+            m_debtorsSeenAlive.insert(cFormId);
+            m_deadDebtors.erase(cFormId);
+            continue;
+        }
+
+        auto deadIt = m_deadDebtors.find(cFormId);
+        if (deadIt == m_deadDebtors.end())
+        {
+            // Killed by a player while this client watched, its own or another client's copy of one. The debtor's
+            // killed-by-player stage was set on that player's client, which the quest sync brings here.
+            Actor* pKiller = Cast<Actor>(TESObjectREFR::GetByHandle(pDebtor->killerHandle));
+            const bool cByPlayer = m_debtorsSeenAlive.contains(cFormId) && pKiller && pKiller->GetExtension()->IsPlayer();
+            deadIt = m_deadDebtors.insert({cFormId, DeadDebtor{now, cByPlayer}}).first;
+        }
+
+        // Only the client running the actor brings it back for everyone, the others' copies follow
+        if (!Utils::GetLocalOwnershipToken(cFormId))
+            continue;
+
+        const double cDeadSeconds = std::chrono::duration<double>(now - deadIt->second.Since).count();
+        if (CombatRules::RevivesDebtor(
+                true, true, pDebtJob->IsStageDone(CombatRules::cTG01JobStage), pDebtJob->IsStageDone(debtor.KilledByPlayerStage), cDeadSeconds, deadIt->second.KilledByPlayer))
+        {
+            spdlog::info("Bringing back TG01 debtor {:X} from alias {}, dead for {} s without a player's kill", cFormId, debtor.AliasId, cDeadSeconds);
+            m_deadDebtors.erase(cFormId);
+            pDebtor->Revive();
         }
     }
 }
@@ -286,7 +415,7 @@ void ActorValueService::RunActorValuesUpdates() noexcept
     BroadcastActorValues();
 }
 
-void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcast& acMessage) const noexcept
+void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcast& acMessage) noexcept
 {
     Actor* pActor = Utils::GetByServerId<Actor>(acMessage.Id);
     if (!pActor)
@@ -295,19 +424,35 @@ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcas
         return;
     }
 
-    const float newHealth = pActor->GetActorValue(ActorValueInfo::kHealth) + acMessage.DeltaHealth;
-    pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, newHealth);
+    // Only the owner's actor dies or goes down of damage, its state then reaches everyone (CombatRules)
+    const ActorExtension* pExtension = pActor->GetExtension();
+    const bool cIsDown = pActor->actorState.IsBleedingOut();
+    if (!cIsDown)
+        m_knockedOut.erase(pActor->formID);
 
-    // Only the owner's copy dies of damage, its death state then reaches everyone. A copy dying on its own health, which
-    // doesn't regenerate, could die while the owner's fights on.
-    const float health = pActor->GetActorValue(ActorValueInfo::kHealth);
-    if (!pActor->IsDead() && health <= 0.f)
+    if (CombatRules::IgnoresRelayedBlow(acMessage.DeltaHealth, m_knockedOut.contains(pActor->formID), cIsDown))
     {
-        ActorExtension* pExtension = pActor->GetExtension();
-        // Players should never be killed
-        if (!pExtension->IsPlayer() && pExtension->IsLocal())
-            pActor->Kill();
+        spdlog::debug("Left a blow of {} out of knocked out actor {:X}", acMessage.DeltaHealth, pActor->formID);
+        return;
     }
+
+    const float cNewHealth = pActor->GetActorValue(ActorValueInfo::kHealth) + acMessage.DeltaHealth;
+    const auto cBlow = CombatRules::ResolveRelayedBlow(
+        acMessage.DeltaHealth, cNewHealth, pExtension->IsLocal(), pExtension->IsPlayer(), pActor->IsDead() || cIsDown, acMessage.NonLethal, IsKnockOnly(pActor));
+
+    // Down before the health drops: at zero health the game queues a death the knock down couldn't take back
+    if (cBlow == CombatRules::Blow::KnockDown)
+    {
+        spdlog::info("Knocking down actor {:X} instead of killing it, essential in the hitter's game: {}", pActor->formID, acMessage.NonLethal);
+        pActor->KnockDown();
+        if (pActor->actorState.IsBleedingOut())
+            m_knockedOut.insert(pActor->formID);
+    }
+
+    pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, cNewHealth);
+
+    if (cBlow == CombatRules::Blow::Kill && !pActor->IsDead())
+        pActor->KillByPlayer(GetActorByServerId(acMessage.HitterId));
 
     // TODO(cosideci): find fix for player health sync so this can be used again
     /*
@@ -394,6 +539,9 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
 
     if (it == std::end(view))
     {
+        if (!acMessage.IsDead && ReviveOwnActor(acMessage))
+            return;
+
         const auto cEntity = Utils::FindEntityByServerId(acMessage.Id);
         spdlog::info(
             "Dropped death state {} for server id {:X} at epoch {}, entity found: {}, has form id: {}, waiting for 3D: {}", acMessage.IsDead, acMessage.Id, acMessage.OwnershipEpoch,
@@ -416,14 +564,25 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
     if (pExtension->IsPlayer())
         return;
 
-    if (pActor->IsDead() != acMessage.IsDead)
+    const auto cFollow = CombatRules::FollowOwner(pActor->IsDead(), pActor->actorState.IsBleedingOut(), acMessage.IsDead, acMessage.IsDown);
+    if (cFollow != CombatRules::Follow::None)
+        spdlog::info("Following the owner of remote actor {:X}, server id: {:X}, dead: {}, down: {}, step: {}", pActor->formID, acMessage.Id, acMessage.IsDead, acMessage.IsDown, static_cast<int>(cFollow));
+
+    switch (cFollow)
     {
-        spdlog::info("Applying death state {} to remote actor {:X}, server id: {:X}", acMessage.IsDead, pActor->formID, acMessage.Id);
-        // Forced: a remote actor refuses its own death action, which left the body standing
-        if (acMessage.IsDead)
-            m_world.GetCharacterService().KillWhenReady(pActor);
-        else
-            pActor->Respawn();
+    case CombatRules::Follow::Kill:
+        // Forced: a remote actor refuses its own death action, which left the body standing. The killer the server passed on is
+        // this client's player when it dealt the blow.
+        m_world.GetCharacterService().KillWhenReady(pActor, GetActorByServerId(acMessage.KillerId));
+        break;
+    case CombatRules::Follow::Revive: pActor->Revive(); break;
+    case CombatRules::Follow::KnockDown:
+        // Bleedout is brief, a copy that can't play it right now just misses it
+        if (pActor->GetNiNode() && pActor->animationGraphHolder.IsReady())
+            pActor->KnockDown();
+        break;
+    case CombatRules::Follow::StandUp: pActor->StandUp(acMessage.Health); break;
+    case CombatRules::Follow::None: break;
     }
 
     // A replayed voice can end before its subtitle packet arrives. Death must also
@@ -431,4 +590,49 @@ void ActorValueService::OnDeathStateChange(const NotifyDeathStateChange& acMessa
     if (acMessage.IsDead)
         if (auto* pSubtitles = SubtitleManager::Get())
             pSubtitles->HideSubtitle(pActor);
+}
+
+bool ActorValueService::ReviveOwnActor(const NotifyDeathStateChange& acMessage) const noexcept
+{
+    // The server never sends an owner its own reports, a death state for one of its actors is a party member's revival
+    auto view = m_world.view<FormIdComponent, LocalComponent>();
+    for (auto entity : view)
+    {
+        const auto& localComponent = view.get<LocalComponent>(entity);
+        if (localComponent.Id != acMessage.Id || localComponent.OwnershipEpoch != acMessage.OwnershipEpoch)
+            continue;
+
+        Actor* pActor = Cast<Actor>(TESForm::GetById(view.get<FormIdComponent>(entity).Id));
+        if (!pActor || !pActor->IsDead() || pActor->GetExtension()->IsPlayer())
+            return false;
+
+        spdlog::info("Bringing back local actor {:X}, server id {:X}, a party member revived it", pActor->formID, acMessage.Id);
+        // Where it lies and as it was, Respawn's Reset would also send it back to its editor location
+        pActor->Revive();
+        return true;
+    }
+
+    return false;
+}
+
+void ActorValueService::OnLocalRevival(const uint32_t aFormId) noexcept
+{
+    if (!m_transport.IsConnected())
+        return;
+
+    const auto cToken = Utils::GetRemoteOwnershipToken(aFormId);
+    Actor* pActor = Cast<Actor>(TESForm::GetById(aFormId));
+    if (!cToken || !pActor || pActor->IsDead())
+        return;
+
+    spdlog::info("Asking for actor {:X}, server id {:X}, to come back for everyone, it was revived here", aFormId, cToken->ServerId);
+
+    // The server accepts it from a party member of the owner standing near the actor, see DeathMemory::AcceptsChange
+    RequestDeathStateChange request;
+    request.Id = cToken->ServerId;
+    request.OwnershipEpoch = cToken->OwnershipEpoch;
+    request.IsDead = false;
+    request.Health = pActor->GetActorValue(ActorValueInfo::kHealth);
+
+    m_transport.Send(request);
 }

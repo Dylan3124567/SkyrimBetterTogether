@@ -22,6 +22,12 @@ void ActionReplayChain::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const 
     }
 }
 
+void ActionReplayChain::DropFurnitureActions() noexcept
+{
+    if (std::erase_if(Actions, [](const ActionEvent& acAction) { return acAction.IsFurnitureAction(); }) > 0)
+        ResetAnimationGraph = true;
+}
+
 void ActionReplayChain::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexcept
 {
     ResetAnimationGraph = Serialization::ReadBool(aReader);

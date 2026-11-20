@@ -2,6 +2,8 @@
 #include "Structs/Inventory.h"
 #include "Structs/ActorData.h"
 #include <Messages/PlayerAppearance.h>
+#include <Systems/CaravanRules.h>
+#include <Systems/SyncRules.h>
 
 struct ActorAddedEvent;
 struct ActorRemovedEvent;
@@ -43,6 +45,7 @@ struct NotifyActorTeleport;
 struct PartyJoinedEvent;
 
 struct Actor;
+struct TESNPC;
 struct World;
 struct TransportService;
 
@@ -58,7 +61,8 @@ struct CharacterService
 
     static void DeleteTempActor(const uint32_t aFormId) noexcept;
 
-    bool RequestOwnership(uint32_t aFormId, uint32_t aServerId, entt::entity aEntity) const noexcept;
+    // @param aForDialogue This client's player is talking to the actor, see RequestOwnershipClaim::ForDialogue
+    bool RequestOwnership(uint32_t aFormId, uint32_t aServerId, entt::entity aEntity, bool aForDialogue = false) const noexcept;
 
     void OnActorAdded(const ActorAddedEvent& acEvent) noexcept;
     void OnActorRemoved(const ActorRemovedEvent& acEvent) noexcept;
@@ -93,14 +97,20 @@ struct CharacterService
     void ProcessNewEntity(entt::entity aEntity) const noexcept;
 
     bool MoveActor(const Actor* apActor, const GameId& acWorldSpaceId, const GameId& acCellId, const Vector3_NetQuantize& acPosition) const noexcept;
-    // Forces the death action, waiting until the actor can play it
-    void KillWhenReady(Actor* apActor) const noexcept;
+    // Forces the death action, waiting until the actor can play it. The killer is who OnDeath scripts get as akKiller.
+    void KillWhenReady(Actor* apActor, Actor* apKiller = nullptr) const noexcept;
 
 private:
 
     void RequestServerAssignment(entt::entity aEntity) const noexcept;
     void CancelServerAssignment(entt::entity aEntity, uint32_t aFormId) const noexcept;
     void DeleteRemoteEntityComponents(entt::entity aEntity) const noexcept;
+    // Makes the actor showing a remote one this client has no game form for, after deleting any earlier one for it
+    Actor* CreateRemoteCopy(uint32_t aServerId, TESNPC* apNpc) const noexcept;
+    // Stops showing a remote actor: the copy made for it is deleted, a game actor goes back to the local game
+    void ReleaseRemoteActor(entt::entity aEntity) const noexcept;
+    // Makes an already spawned actor fit a new spawn of it, see the definition
+    void RefreshSpawnedActor(const CharacterSpawnRequest& acMessage) const noexcept;
     void DeclineOwnership(uint32_t aServerId, uint32_t aOwnershipEpoch) const noexcept;
     void ReconcileActorData(entt::entity aEntity, Actor* apActor, uint32_t aOwnershipEpoch, const ActorData& acActorData, bool aApplyInventory, bool aIsLocalOwner) noexcept;
 
@@ -117,6 +127,8 @@ private:
     void RunSceneUpdates() noexcept;
     void RunFactionsUpdates() const noexcept;
     void RunSpawnUpdates() const noexcept;
+    void RunCopyCleanup() noexcept;
+    void RunCaravanUpdates() noexcept;
     void RunExperienceUpdates() noexcept;
     void ApplyCachedWeaponDraws(const UpdateEvent& acUpdateEvent) noexcept;
 
@@ -134,6 +146,16 @@ private:
         bool Disabling = false;
     };
     mutable Map<uint32_t, PendingAppearance> m_pendingAppearances;
+
+    // The game actors this client made for other clients' actors, by server id
+    mutable SyncRules::RemoteCopies m_remoteCopies{};
+    // Copies this client was given to run. Still copies: let go, they go, or they came back as new actors of this client's.
+    mutable Set<uint32_t> m_ownedCopies{};
+    double m_nextCopyCleanup{};
+
+    // Where each of CaravanRules::kCaravans has been seen camped by its leader copy
+    std::array<CaravanRules::CampTracker, CaravanRules::kCaravans.size()> m_caravanCamps{};
+    double m_nextCaravanUpdate{};
 
     // TODO: revamp this, read the local anim var like vampire lord?
     struct WeaponDrawData

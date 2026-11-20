@@ -15,6 +15,7 @@ struct CellChangeEvent;
 struct ScriptAnimationEvent;
 struct AssignObjectsResponse;
 struct NotifyScriptAnimation;
+struct WorldObjectState;
 
 /**
  * @brief Handles objects in the environment.
@@ -28,6 +29,7 @@ private:
     void OnDisconnected(const DisconnectedEvent&) noexcept;
     void OnCellChange(const CellChangeEvent&) noexcept;
     void OnAssignObjectsResponse(const AssignObjectsResponse&) noexcept;
+    void ApplyRememberedState(const WorldObjectState& acState) noexcept;
     void OnActivate(const ActivateEvent&) noexcept;
     void OnActivateNotify(const NotifyActivate&) noexcept;
     void OnLockChange(const LockChangeEvent&) noexcept;

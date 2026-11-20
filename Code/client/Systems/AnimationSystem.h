@@ -17,9 +17,10 @@ struct AnimationSystem
      * @param aWorld The registry where the actor in question lives.
      * @param apActor The actor to-be-updated.
      * @param aAnimationComponent The animation component attached to the actor.
+     * @param aInterpolationComponent What the owner's snapshots say, decides whether an action that seats the actor plays.
      * @param aTick The owner tick currently being played back, actions up to it are run.
      */
-    static void Update(World& aWorld, Actor* apActor, RemoteAnimationComponent& aAnimationComponent, uint64_t aTick) noexcept;
+    static void Update(World& aWorld, Actor* apActor, RemoteAnimationComponent& aAnimationComponent, InterpolationComponent& aInterpolationComponent, uint64_t aTick) noexcept;
     /**
      * @brief Sets up the animation system for a particular actor.
      * @param aWorld The registry where the actor in question lives.

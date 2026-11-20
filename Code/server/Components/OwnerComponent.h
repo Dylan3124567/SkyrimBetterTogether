@@ -25,4 +25,6 @@ struct OwnerComponent
     Player* pOwner;
     uint32_t OwnershipEpoch;
     Vector<const Player*> InvalidOwners{};
+    // Server tick of the last hand-over to a party member talking to the actor
+    uint64_t LastDialogueTransfer{0};
 };

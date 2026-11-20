@@ -1,5 +1,5 @@
 import { Overlay } from '@angular/cdk/overlay';
-import { Component, OnInit, ViewChild } from '@angular/core';
+import { Component, ElementRef, OnInit, ViewChild } from '@angular/core';
 import { TranslocoService } from '@ngneat/transloco';
 import { takeUntil } from 'rxjs';
 import { environment } from '../../../environments/environment';
@@ -52,6 +52,26 @@ export class RootComponent implements OnInit {
   @ViewChild('chat') private chatComp!: ChatComponent;
   @ViewChild(GroupComponent) private groupComponent: GroupComponent;
 
+  private shortcutBox?: HTMLElement;
+  private readonly shortcutObserver = new MutationObserver(() =>
+    this.fitShortcut(),
+  );
+
+  @ViewChild('shortcut', { read: ElementRef })
+  private set shortcut(ref: ElementRef<HTMLElement> | undefined) {
+    this.shortcutObserver.disconnect();
+    this.shortcutBox = ref?.nativeElement;
+    if (this.shortcutBox) {
+      // Labels change with the connection state and the language.
+      this.shortcutObserver.observe(this.shortcutBox, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      });
+      this.fitShortcut();
+    }
+  }
+
   public constructor(
     private readonly destroy$: DestroyService,
     private readonly client: ClientService,
@@ -70,6 +90,36 @@ export class RootComponent implements OnInit {
     this.onInGameStateSubscription();
     this.onActivationStateSubscription();
     this.onFontSizeSubscription();
+    // Text metrics change once the font arrives, and rounding changes with the view size.
+    document.fonts.addEventListener('loadingdone', () => this.fitShortcut());
+    window.addEventListener('resize', () => this.fitShortcut());
+  }
+
+  // The multiplayer box has a fixed rectangle (see root.component.scss). English fits at full size; a longer
+  // translation scales the box's text down in 5% steps until no label is cut. Labels change only while the box is
+  // hidden or right after a click, so these few layouts never cost a visible frame.
+  private fitShortcut(): void {
+    const box = this.shortcutBox;
+    if (!box) {
+      return;
+    }
+    const entries = box.querySelector('.multiplayer-shortcut-entries');
+    const buttons = Array.from(box.querySelectorAll('button'));
+    const last = buttons[buttons.length - 1];
+    // Rows never shrink below their lines, so they overflow downwards when they do not fit (the box's padding below
+    // takes a sub-pixel of rounding). Line boxes are 1em, so scrollHeight would also count the glyphs' unused descent.
+    const overflows = () =>
+      (!!entries &&
+        !!last &&
+        last.getBoundingClientRect().bottom >
+          entries.getBoundingClientRect().bottom + 1) ||
+      buttons.some(b => b.scrollWidth > b.clientWidth);
+    let fit = 1;
+    box.style.setProperty('--sbt-fit', '1');
+    while (fit > 0.5 && overflows()) {
+      fit -= 0.05;
+      box.style.setProperty('--sbt-fit', fit.toFixed(2));
+    }
   }
 
   public onInGameStateSubscription() {

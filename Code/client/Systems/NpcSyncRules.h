@@ -42,6 +42,7 @@ inline bool IsAmbushAwake(const float aVariable01, const float aAggression) noex
 
 /**
  * @brief Whether a client should ask for an NPC it only has a remote copy of, so that its AI runs somewhere.
+ * @param aWokeUnderOwner The AI has to run on this client now: an ambush woke here, or this client's player talks to it.
  * @param aLastSnapshot When the owner was last heard from in milliseconds, negative until the first check. Owned by the caller.
  * @param aLastClaim When the last claim went out, owned by the caller.
  */
@@ -86,6 +87,33 @@ inline bool ShouldReleaseFromScene(const bool aIsBlockingPhase, const uint64_t a
     aHoldStart = -1.0;
     aReleasedPhase = aPhaseKey;
     return true;
+}
+
+/**
+ * @brief Factions that say how an actor stands with the player: follower, hireling, spouse. Form ids are from Skyrim.esm.
+ *
+ * Each client has its own player, so an owner's factions never change these here. Taken from another client they made
+ * its follower ours as well, while our follower quest never had the actor: following, trading and dismissing did nothing,
+ * and stayed broken in our save after disconnecting.
+ */
+inline bool IsPlayerRelationshipFaction(const uint32_t aFormId) noexcept
+{
+    switch (aFormId)
+    {
+    case 0x5C84E: // CurrentFollowerFaction
+    case 0x5C84D: // PotentialFollowerFaction
+    case 0x5C84C: // DismissedFollowerFaction
+    case 0x84D1B: // PlayerFollowerFaction
+    case 0xBD738: // CurrentHireling
+    case 0xBCC9A: // PotentialHireling
+    case 0x19809: // PotentialMarriageFaction
+    case 0x7431A: // MarriageCourtingFaction
+    case 0xFF7F3: // MarriageAskedFaction
+    case 0xC6472: // PlayerMarriedFaction
+        return true;
+    default:
+        return false;
+    }
 }
 
 /**

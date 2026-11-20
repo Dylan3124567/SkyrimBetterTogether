@@ -217,7 +217,10 @@ struct TESQuest : BGSStoryManagerTreeForm
 
     bool SetStage(uint16_t stage);
     bool ScriptSetStage(uint16_t stage);
-    void SetStopped();
+    // The game's own stop, as Papyrus Quest.Stop
+    void Stop() noexcept;
+    // Completes or fails the quest as a Complete Quest or Fail Quest log entry does
+    void SetEnded(bool aFailed) noexcept;
     bool IsStageReached(uint16_t aStage) noexcept;
     uint32_t GetStageItemCount(uint16_t aStage) noexcept;
 };

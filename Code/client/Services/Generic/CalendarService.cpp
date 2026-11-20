@@ -215,7 +215,10 @@ void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
         pGameTime->GameDay->f = m_onlineTime.m_timeModel.Day;
         pGameTime->GameMonth->f = m_onlineTime.m_timeModel.Month;
         pGameTime->GameYear->f = m_onlineTime.m_timeModel.Year;
-        pGameTime->GameDaysPassed->f += m_onlineTime.GetDeltaTime(delta) * (1.f / 24.f);
+        // In bed waiting for the others the days stand still, as in vanilla's paused sleep menu. Survival restores
+        // what passed between OnSleepStart and OnSleepStop, so the wait would count as sleep for whoever lay down first.
+        const bool cWaitingInBed = s_sleepActive && !s_sleepFinished;
+        pGameTime->GameDaysPassed->f = m_daysPassed.Advance(pGameTime->GameDaysPassed->f, cWaitingInBed ? 0.0 : m_onlineTime.GetDeltaTime(delta));
 
         // time transition in
         if (m_fadeTimer < kTransitionSpeed)
@@ -225,6 +228,10 @@ void CalendarService::HandleUpdate(const UpdateEvent& aEvent) noexcept
         }
         else
             pGameTime->GameHour->f = m_onlineTime.m_timeModel.Time;
+
+        // The game's own clock rebuilds the days from this plus GameHour / 24 once it runs again (native sleep,
+        // disconnecting), which would otherwise drop every day that passed while connected.
+        pGameTime->rawDaysPassed = pGameTime->GameDaysPassed->f - pGameTime->GameHour->f / 24.f;
     }
 }
 

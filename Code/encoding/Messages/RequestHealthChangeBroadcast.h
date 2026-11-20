@@ -14,8 +14,10 @@ struct RequestHealthChangeBroadcast final : ClientMessage
     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
 
-    bool operator==(const RequestHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
+    bool operator==(const RequestHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && DeltaHealth == acRhs.DeltaHealth && NonLethal == acRhs.NonLethal && GetOpcode() == acRhs.GetOpcode(); }
 
     uint32_t Id;
     float DeltaHealth;
+    // The sender's game would only knock the actor down (essential there), so its owner must not kill it
+    bool NonLethal{};
 };

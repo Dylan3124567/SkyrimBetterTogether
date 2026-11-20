@@ -1,5 +1,6 @@
 #include <Services/HelgenService.h>
 #include <Forms/TESQuest.h>
+#include <PlayerCharacter.h>
 
 #include <Services/PapyrusService.h>
 
@@ -112,10 +113,31 @@ bool TESQuest::ScriptSetStage(uint16_t stageIndex)
     return IsStageReached(stageIndex);
 }
 
-void TESQuest::SetStopped()
+// What Papyrus Quest.Stop does (native 56686: SetEnabled(false), 24987, if enabled). That only asks: the quest manager
+// (32487) then runs the shutdown stages and, once their fragments are done, stops the quest's scenes, clears its aliases
+// and sends TESQuestStartStopEvent (25047).
+void TESQuest::Stop() noexcept
 {
-    flags &= 0xFFFE;
-    MarkChanged(2);
+    TP_THIS_FUNCTION(TSetEnabled, void, TESQuest, bool);
+    POINTER_SKYRIMSE(TSetEnabled, setEnabled, 24987);
+
+    if (IsEnabled())
+        TiltedPhoques::ThisCall(setEnabled.Get(), this, false);
+}
+
+// What a stage's log entry flagged Complete Quest or Fail Quest does (TESQuestStageItem 25260): SetCompleted (24991) or
+// SetFailed (24988), which also show the HUD message, then the player drops the quest's targets (40516).
+void TESQuest::SetEnded(bool aFailed) noexcept
+{
+    TP_THIS_FUNCTION(TSetEndFlag, void, TESQuest, bool);
+    POINTER_SKYRIMSE(TSetEndFlag, setCompleted, 24991);
+    POINTER_SKYRIMSE(TSetEndFlag, setFailed, 24988);
+    TP_THIS_FUNCTION(TRemoveQuestTargets, void, PlayerCharacter, TESQuest*);
+    POINTER_SKYRIMSE(TRemoveQuestTargets, removeQuestTargets, 40516);
+
+    TiltedPhoques::ThisCall((aFailed ? setFailed : setCompleted).Get(), this, true);
+    if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+        TiltedPhoques::ThisCall(removeQuestTargets.Get(), pPlayer, this);
 }
 
 bool TESQuest::IsStageReached(uint16_t aStage) noexcept

@@ -16,8 +16,13 @@ struct RequestOwnershipClaim final : ClientMessage
     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
 
-    bool operator==(const RequestOwnershipClaim& achRhs) const noexcept { return ServerId == achRhs.ServerId && ExpectedOwnershipEpoch == achRhs.ExpectedOwnershipEpoch && GetOpcode() == achRhs.GetOpcode(); }
+    bool operator==(const RequestOwnershipClaim& achRhs) const noexcept
+    {
+        return ServerId == achRhs.ServerId && ExpectedOwnershipEpoch == achRhs.ExpectedOwnershipEpoch && ForDialogue == achRhs.ForDialogue && GetOpcode() == achRhs.GetOpcode();
+    }
 
     uint32_t ServerId{};
     uint32_t ExpectedOwnershipEpoch{};
+    // The sender's player is talking to the actor, which only stands still for it where its AI runs
+    bool ForDialogue{};
 };
