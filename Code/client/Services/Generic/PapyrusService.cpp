@@ -11,6 +11,8 @@ PapyrusService::PapyrusService(entt::dispatcher& aDispatcher) noexcept
 
 const void* PapyrusService::Get(const String& acNamespace, const String& acFunction) const noexcept
 {
+    const std::lock_guard lock(m_lock);
+
     const auto itor = m_functions.find(acNamespace + "::" + acFunction);
     if (itor != std::end(m_functions))
         return itor->second;
@@ -20,5 +22,7 @@ const void* PapyrusService::Get(const String& acNamespace, const String& acFunct
 
 void PapyrusService::HandlePapyrusFunctionEvent(const PapyrusFunctionRegisterEvent& acEvent) noexcept
 {
+    const std::lock_guard lock(m_lock);
+
     m_functions[acEvent.Namespace + "::" + acEvent.Name] = acEvent.Function;
 }
